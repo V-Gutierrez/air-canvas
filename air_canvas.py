@@ -198,6 +198,11 @@ class HandState:
 
     def reset_draw(self):
         self.prev_pos = None
+        self.smooth_x = None
+        self.smooth_y = None
+        self.prev_wrist_pos = None
+        self.speed = 0.0
+        self.open_palm_start = None
         self.drawing = False
         self.cursor_pos = None
 
@@ -353,7 +358,13 @@ class AirCanvas:
         for state in (self.left_hand, self.right_hand):
             if state.cursor_pos is None:
                 continue
-            cv2.circle(display, state.cursor_pos, state.cursor_thickness // 2 + 4, state.color, 2)
+            cv2.circle(
+                display,
+                state.cursor_pos,
+                state.cursor_thickness // 2 + 4,
+                state.color,
+                2,
+            )
 
     def _draw_ui(self, display):
         """Draw UI overlay."""
@@ -447,7 +458,11 @@ class AirCanvas:
                             result.hand_landmarks, result.handedness
                         ):
                             hand_label = handedness[0].category_name
-                            state = self.right_hand if hand_label == "Left" else self.left_hand
+                            state = (
+                                self.right_hand
+                                if hand_label == "Left"
+                                else self.left_hand
+                            )
                             seen_states.add(state)
                             self._process_hand(landmarks, hand_label, frame)
 
@@ -480,6 +495,7 @@ class AirCanvas:
                     print(f"💾 Saved: {filename}")
         finally:
             self.camera_thread.stop()
+            self.detector.close()
             cv2.destroyAllWindows()
 
 
