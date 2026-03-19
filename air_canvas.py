@@ -6,6 +6,7 @@ import numpy as np
 import math
 import time
 import os
+import threading
 import urllib.request
 from collections import deque
 from typing import Optional, Tuple, List
@@ -44,9 +45,53 @@ def download_model():
     print("Model downloaded.")
 
 
+class CameraThread:
+    def __init__(self, cap: cv2.VideoCapture):
+        self._cap = cap
+        self._frame: Optional[np.ndarray] = None
+        self._new_frame = False
+        self._running = False
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while self._running:
+            ret, frame = self._cap.read()
+            if not self._running:
+                break
+            if not ret:
+                time.sleep(0.01)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._new_frame = True
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            is_new_frame = self._new_frame
+            self._new_frame = False
+            return is_new_frame, self._frame.copy()
+
+    def stop(self):
+        self._running = False
+        self._cap.release()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+
 # ---------------------------------------------------------------------------
 # Gesture helpers
 # ---------------------------------------------------------------------------
+
 
 def is_finger_extended(landmarks, tip_idx, pip_idx) -> bool:
     """A finger is extended if TIP is above PIP (lower y = higher on screen)."""
@@ -100,6 +145,7 @@ def fingertip_pos(landmarks, frame_w, frame_h) -> Tuple[int, int]:
 # Hand state tracker (one per hand)
 # ---------------------------------------------------------------------------
 
+
 class HandState:
     def __init__(self, colors: List[Tuple[int, int, int]]):
         self.colors = colors
@@ -112,6 +158,8 @@ class HandState:
         self.open_palm_start: Optional[float] = None
         self.prev_wrist_pos: Optional[Tuple[float, float]] = None
         self.speed = 0.0
+        self.cursor_pos: Optional[Tuple[int, int]] = None
+        self.cursor_thickness = BRUSH_MIN_THICKNESS
 
     @property
     def color(self) -> Tuple[int, int, int]:
@@ -121,7 +169,7 @@ class HandState:
         self.color_idx = (self.color_idx + 1) % len(self.colors)
 
     def smooth(self, x: int, y: int) -> Tuple[int, int]:
-        if self.smooth_x is None:
+        if self.smooth_x is None or self.smooth_y is None:
             self.smooth_x, self.smooth_y = float(x), float(y)
         else:
             self.smooth_x += DRAW_SMOOTHING * (x - self.smooth_x)
@@ -141,17 +189,23 @@ class HandState:
         elif self.speed > SPEED_FAST_THRESHOLD:
             return BRUSH_MIN_THICKNESS
         else:
-            t = (self.speed - SPEED_SLOW_THRESHOLD) / (SPEED_FAST_THRESHOLD - SPEED_SLOW_THRESHOLD)
-            return int(BRUSH_MAX_THICKNESS - t * (BRUSH_MAX_THICKNESS - BRUSH_MIN_THICKNESS))
+            t = (self.speed - SPEED_SLOW_THRESHOLD) / (
+                SPEED_FAST_THRESHOLD - SPEED_SLOW_THRESHOLD
+            )
+            return int(
+                BRUSH_MAX_THICKNESS - t * (BRUSH_MAX_THICKNESS - BRUSH_MIN_THICKNESS)
+            )
 
     def reset_draw(self):
         self.prev_pos = None
         self.drawing = False
+        self.cursor_pos = None
 
 
 # ---------------------------------------------------------------------------
 # Canvas
 # ---------------------------------------------------------------------------
+
 
 class AirCanvas:
     def __init__(self):
@@ -165,9 +219,13 @@ class AirCanvas:
         if not ret:
             raise RuntimeError("Cannot read from camera")
 
+        self.camera_thread = CameraThread(self.cap)
+        self.camera_thread.start()
+
         self.frame_h, self.frame_w = frame.shape[:2]
-        self.canvas = np.full((self.frame_h, self.frame_w, 3),
-                              CANVAS_BG_COLOR, dtype=np.uint8)
+        self.canvas = np.full(
+            (self.frame_h, self.frame_w, 3), CANVAS_BG_COLOR, dtype=np.uint8
+        )
 
         self.left_hand = HandState(LEFT_HAND_COLORS)
         self.right_hand = HandState(RIGHT_HAND_COLORS)
@@ -181,7 +239,6 @@ class AirCanvas:
             min_hand_presence_confidence=TRACKING_CONFIDENCE,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
-        self.frame_count = 0
         self.fps = 0.0
         self.fps_timer = time.time()
         self.fps_count = 0
@@ -197,6 +254,9 @@ class AirCanvas:
         """Open built-in camera, skip iPhone Continuity Camera."""
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            print(f"Camera FPS requested: 30, actual: {actual_fps:.1f}")
             return cap
         # Fallback: try other indices
         for idx in range(5):
@@ -204,7 +264,10 @@ class AirCanvas:
                 continue
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
                 print(f"Camera opened at index {idx}")
+                print(f"Camera FPS requested: 30, actual: {actual_fps:.1f}")
                 return cap
             cap.release()
         return None
@@ -254,24 +317,43 @@ class AirCanvas:
 
             if state.prev_pos is not None:
                 # Draw on canvas
-                cv2.line(self.canvas, state.prev_pos, smooth_pos,
-                         state.color, thickness, cv2.LINE_AA)
+                cv2.line(
+                    self.canvas,
+                    state.prev_pos,
+                    smooth_pos,
+                    state.color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
                 # Glow effect
                 if BRUSH_GLOW:
                     glow_layer = np.zeros_like(self.canvas)
-                    cv2.line(glow_layer, state.prev_pos, smooth_pos,
-                             state.color, thickness + BRUSH_GLOW_RADIUS, cv2.LINE_AA)
-                    glow_layer = cv2.GaussianBlur(glow_layer, (0, 0), BRUSH_GLOW_RADIUS // 2)
+                    cv2.line(
+                        glow_layer,
+                        state.prev_pos,
+                        smooth_pos,
+                        state.color,
+                        thickness + BRUSH_GLOW_RADIUS,
+                        cv2.LINE_AA,
+                    )
+                    glow_layer = cv2.GaussianBlur(
+                        glow_layer, (0, 0), BRUSH_GLOW_RADIUS // 2
+                    )
                     self.canvas = cv2.add(self.canvas, glow_layer // 3)
 
             state.prev_pos = smooth_pos
             state.drawing = True
-
-            # Draw cursor indicator on camera frame
-            cv2.circle(frame, smooth_pos, thickness // 2 + 4, state.color, 2)
+            state.cursor_pos = smooth_pos
+            state.cursor_thickness = thickness
         else:
             state.reset_draw()
+
+    def _draw_cursors(self, display):
+        for state in (self.left_hand, self.right_hand):
+            if state.cursor_pos is None:
+                continue
+            cv2.circle(display, state.cursor_pos, state.cursor_thickness // 2 + 4, state.color, 2)
 
     def _draw_ui(self, display):
         """Draw UI overlay."""
@@ -279,82 +361,126 @@ class AirCanvas:
 
         # Left hand color indicator
         cv2.circle(display, (40, h - 40), 20, self.left_hand.color, -1)
-        cv2.putText(display, "L", (30, h - 32), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            display,
+            "L",
+            (30, h - 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
         # Right hand color indicator
         cv2.circle(display, (w - 40, h - 40), 20, self.right_hand.color, -1)
-        cv2.putText(display, "R", (w - 50, h - 32), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            display,
+            "R",
+            (w - 50, h - 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
         # FPS
-        cv2.putText(display, f"FPS: {self.fps:.0f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(
+            display,
+            f"FPS: {self.fps:.0f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
 
         # Instructions
-        cv2.putText(display, "Point=Draw | Fist=Stop | Pinch=Color | Palm=Clear",
-                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(
+            display,
+            "Point=Draw | Fist=Stop | Pinch=Color | Palm=Clear",
+            (10, h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
 
     def run(self):
         if FULLSCREEN:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
-                                  cv2.WINDOW_FULLSCREEN)
+            cv2.setWindowProperty(
+                WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+            )
 
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+        try:
+            while True:
+                is_new_frame, frame = self.camera_thread.read()
+                if frame is None:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == QUIT_KEY:
+                        break
+                    continue
 
-            frame = cv2.flip(frame, 1)  # Mirror
-            self.frame_count += 1
+                frame = cv2.flip(frame, 1)  # Mirror
 
-            # FPS calculation
-            self.fps_count += 1
-            elapsed = time.time() - self.fps_timer
-            if elapsed >= 1.0:
-                self.fps = self.fps_count / elapsed
-                self.fps_count = 0
-                self.fps_timer = time.time()
+                if is_new_frame:
+                    # FPS calculation
+                    self.fps_count += 1
+                    elapsed = time.time() - self.fps_timer
+                    if elapsed >= 1.0:
+                        self.fps = self.fps_count / elapsed
+                        self.fps_count = 0
+                        self.fps_timer = time.time()
 
-            # MediaPipe detection
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts_ms = int(self.frame_count * (1000 / 30))
-            result = self.detector.detect_for_video(mp_image, ts_ms)
+                    small_frame = cv2.resize(frame, (640, 480))
+                    rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    ts_ms = int(time.monotonic() * 1000)
+                    result = self.detector.detect_for_video(mp_image, ts_ms)
 
-            # Process each hand
-            if result.hand_landmarks and result.handedness:
-                for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
-                    hand_label = handedness[0].category_name
-                    self._process_hand(landmarks, hand_label, frame)
+                    seen_states = set()
+                    if result.hand_landmarks and result.handedness:
+                        for landmarks, handedness in zip(
+                            result.hand_landmarks, result.handedness
+                        ):
+                            hand_label = handedness[0].category_name
+                            state = self.right_hand if hand_label == "Left" else self.left_hand
+                            seen_states.add(state)
+                            self._process_hand(landmarks, hand_label, frame)
 
-            # Composite: camera feed + canvas overlay
-            # Canvas strokes on top of camera (semi-transparent)
-            mask = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(mask, 25, 255, cv2.THRESH_BINARY)
-            mask_3ch = cv2.merge([mask, mask, mask])
+                    for state in (self.left_hand, self.right_hand):
+                        if state not in seen_states:
+                            state.reset_draw()
 
-            display = frame.copy()
-            display = np.where(mask_3ch > 0, self.canvas, display)
+                # Composite: camera feed + canvas overlay
+                # Canvas strokes on top of camera (semi-transparent)
+                mask = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
+                _, mask = cv2.threshold(mask, 25, 255, cv2.THRESH_BINARY)
+                mask_3ch = cv2.merge([mask, mask, mask])
 
-            self._draw_ui(display)
-            cv2.imshow(WINDOW_NAME, display)
+                display = frame.copy()
+                display = np.where(mask_3ch > 0, self.canvas, display)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == QUIT_KEY:
-                break
-            elif key == CLEAR_KEY:
-                self.canvas[:] = CANVAS_BG_COLOR
-                print("🧹 Canvas cleared!")
-            elif key == SAVE_KEY:
-                filename = f"drawing_{int(time.time())}.png"
-                cv2.imwrite(filename, self.canvas)
-                print(f"💾 Saved: {filename}")
+                self._draw_cursors(display)
+                self._draw_ui(display)
+                cv2.imshow(WINDOW_NAME, display)
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+                key = cv2.waitKey(1) & 0xFF
+                if key == QUIT_KEY:
+                    break
+                elif key == CLEAR_KEY:
+                    self.canvas[:] = CANVAS_BG_COLOR
+                    print("🧹 Canvas cleared!")
+                elif key == SAVE_KEY:
+                    filename = f"drawing_{int(time.time())}.png"
+                    cv2.imwrite(filename, self.canvas)
+                    print(f"💾 Saved: {filename}")
+        finally:
+            self.camera_thread.stop()
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
