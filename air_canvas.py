@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Air Canvas — Two-hand finger painting with MediaPipe for kids."""
 
-import cv2
 import numpy as np
 import math
 import time
@@ -14,18 +13,353 @@ import subprocess
 import random
 import threading
 import urllib.request
+import importlib
+import importlib.util
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from datetime import datetime
+from typing import Optional, Tuple, List, Protocol, Any
+
+_cv2_spec = importlib.util.find_spec("cv2")
+if _cv2_spec is not None:
+    cv2 = importlib.import_module("cv2")
+else:
+    import colorsys
+
+    class _FallbackVideoCapture:
+        def __init__(self, *_args, **_kwargs):
+            self._opened = False
+
+        def isOpened(self):
+            return self._opened
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return False
+
+        def get(self, *_args, **_kwargs):
+            return 0.0
+
+    class _CV2Fallback:
+        COLOR_HSV2BGR = 1
+        COLOR_BGR2GRAY = 2
+        COLOR_BGR2RGB = 3
+        THRESH_BINARY = 0
+        LINE_AA = 16
+        BORDER_CONSTANT = 0
+        FONT_HERSHEY_SIMPLEX = 0
+        WINDOW_NORMAL = 0
+        WND_PROP_FULLSCREEN = 0
+        WINDOW_FULLSCREEN = 0
+        CAP_PROP_FPS = 5
+        INTER_LANCZOS4 = 4
+        VideoCapture = _FallbackVideoCapture
+
+        @staticmethod
+        def cvtColor(image, code):
+            if code == _CV2Fallback.COLOR_HSV2BGR:
+                hsv = np.asarray(image, dtype=np.uint8)
+                bgr = np.zeros_like(hsv)
+                for y in range(hsv.shape[0]):
+                    for x in range(hsv.shape[1]):
+                        h, s, v = hsv[y, x]
+                        r, g, b = colorsys.hsv_to_rgb(
+                            float(h) / 179.0,
+                            float(s) / 255.0,
+                            float(v) / 255.0,
+                        )
+                        bgr[y, x] = (
+                            int(round(b * 255)),
+                            int(round(g * 255)),
+                            int(round(r * 255)),
+                        )
+                return bgr
+            if code == _CV2Fallback.COLOR_BGR2GRAY:
+                if image.ndim == 2:
+                    return image.copy()
+                blue = image[:, :, 0].astype(np.float32)
+                green = image[:, :, 1].astype(np.float32)
+                red = image[:, :, 2].astype(np.float32)
+                return np.clip(
+                    0.114 * blue + 0.587 * green + 0.299 * red, 0, 255
+                ).astype(np.uint8)
+            if code == _CV2Fallback.COLOR_BGR2RGB:
+                return image[:, :, ::-1].copy()
+            raise ValueError(f"Unsupported color conversion: {code}")
+
+        @staticmethod
+        def threshold(image, thresh, max_value, _threshold_type):
+            binary = np.where(image > thresh, max_value, 0).astype(np.uint8)
+            return thresh, binary
+
+        @staticmethod
+        def merge(channels):
+            return np.stack(channels, axis=-1)
+
+        @staticmethod
+        def add(src1, src2, dst=None):
+            result = np.clip(
+                src1.astype(np.int16) + src2.astype(np.int16), 0, 255
+            ).astype(np.uint8)
+            if dst is not None:
+                dst[:] = result
+                return dst
+            return result
+
+        @staticmethod
+        def addWeighted(src1, alpha, src2, beta, gamma, dst=None):
+            result = (
+                src1.astype(np.float32) * alpha + src2.astype(np.float32) * beta + gamma
+            )
+            clipped = np.clip(result, 0, 255).astype(np.uint8)
+            if dst is not None:
+                dst[:] = clipped
+                return dst
+            return clipped
+
+        @staticmethod
+        def resize(image, size, interpolation=None):
+            width, height = size
+            src_h, src_w = image.shape[:2]
+            y_idx = np.linspace(0, src_h - 1, height).astype(int)
+            x_idx = np.linspace(0, src_w - 1, width).astype(int)
+            return image[np.ix_(y_idx, x_idx)]
+
+        @staticmethod
+        def copyMakeBorder(
+            image, top, bottom, left, right, _border_type, value=(0, 0, 0)
+        ):
+            output = np.empty(
+                (
+                    image.shape[0] + top + bottom,
+                    image.shape[1] + left + right,
+                    image.shape[2],
+                ),
+                dtype=image.dtype,
+            )
+            output[:] = value
+            output[top : top + image.shape[0], left : left + image.shape[1]] = image
+            return output
+
+        @staticmethod
+        def putText(
+            image, text, origin, _font, scale, color, thickness, _line_type=None
+        ):
+            x, y = origin
+            height = max(6, int(12 * scale))
+            width = max(1, int(len(text) * 7 * scale))
+            return _CV2Fallback.rectangle(
+                image, (x, y - height), (x + width, y), color, thickness
+            )
+
+        @staticmethod
+        def rectangle(image, pt1, pt2, color, thickness):
+            x1, y1 = pt1
+            x2, y2 = pt2
+            x1, x2 = sorted((int(x1), int(x2)))
+            y1, y2 = sorted((int(y1), int(y2)))
+            if thickness < 0:
+                image[y1 : y2 + 1, x1 : x2 + 1] = color
+                return image
+            image[y1 : y1 + thickness, x1 : x2 + 1] = color
+            image[y2 - thickness + 1 : y2 + 1, x1 : x2 + 1] = color
+            image[y1 : y2 + 1, x1 : x1 + thickness] = color
+            image[y1 : y2 + 1, x2 - thickness + 1 : x2 + 1] = color
+            return image
+
+        @staticmethod
+        def circle(image, center, radius, color, thickness, _line_type=None):
+            cx, cy = center
+            yy, xx = np.ogrid[: image.shape[0], : image.shape[1]]
+            dist_sq = (xx - int(cx)) ** 2 + (yy - int(cy)) ** 2
+            radius_sq = int(radius) ** 2
+            if thickness < 0:
+                mask = dist_sq <= radius_sq
+            else:
+                inner = max(0, int(radius) - max(1, int(thickness)))
+                mask = (dist_sq <= radius_sq) & (dist_sq >= inner * inner)
+            image[mask] = color
+            return image
+
+        @staticmethod
+        def ellipse(image, center, axes, _angle, _start, _end, color, thickness):
+            cx, cy = center
+            ax, ay = max(1, int(axes[0])), max(1, int(axes[1]))
+            yy, xx = np.ogrid[: image.shape[0], : image.shape[1]]
+            norm = ((xx - int(cx)) / ax) ** 2 + ((yy - int(cy)) / ay) ** 2
+            if thickness < 0:
+                mask = norm <= 1.0
+            else:
+                inner_ax = max(1, ax - max(1, int(thickness)))
+                inner_ay = max(1, ay - max(1, int(thickness)))
+                inner = ((xx - int(cx)) / inner_ax) ** 2 + (
+                    (yy - int(cy)) / inner_ay
+                ) ** 2
+                mask = (norm <= 1.0) & (inner >= 1.0)
+            image[mask] = color
+            return image
+
+        @staticmethod
+        def _draw_line(image, start, end, color, thickness):
+            x1, y1 = start
+            x2, y2 = end
+            steps = max(abs(int(x2) - int(x1)), abs(int(y2) - int(y1)), 1)
+            xs = np.linspace(x1, x2, steps + 1)
+            ys = np.linspace(y1, y2, steps + 1)
+            radius = max(1, int(math.ceil(thickness / 2)))
+            for x, y in zip(xs, ys):
+                _CV2Fallback.circle(
+                    image, (int(round(x)), int(round(y))), radius, color, -1
+                )
+            return image
+
+        @staticmethod
+        def line(image, pt1, pt2, color, thickness, _line_type=None):
+            return _CV2Fallback._draw_line(image, pt1, pt2, color, thickness)
+
+        @staticmethod
+        def polylines(image, polygons, is_closed, color, thickness):
+            for polygon in polygons:
+                points = np.asarray(polygon).reshape(-1, 2)
+                for index in range(len(points) - 1):
+                    _CV2Fallback._draw_line(
+                        image,
+                        tuple(points[index]),
+                        tuple(points[index + 1]),
+                        color,
+                        thickness,
+                    )
+                if is_closed and len(points) > 1:
+                    _CV2Fallback._draw_line(
+                        image,
+                        tuple(points[-1]),
+                        tuple(points[0]),
+                        color,
+                        thickness,
+                    )
+            return image
+
+        @staticmethod
+        def fillPoly(image, polygons, color):
+            for polygon in polygons:
+                points = np.asarray(polygon).reshape(-1, 2)
+                min_x = max(0, int(np.floor(points[:, 0].min())))
+                max_x = min(image.shape[1] - 1, int(np.ceil(points[:, 0].max())))
+                min_y = max(0, int(np.floor(points[:, 1].min())))
+                max_y = min(image.shape[0] - 1, int(np.ceil(points[:, 1].max())))
+                for y in range(min_y, max_y + 1):
+                    intersections = []
+                    for index in range(len(points)):
+                        x1, y1 = points[index]
+                        x2, y2 = points[(index + 1) % len(points)]
+                        if y1 == y2:
+                            continue
+                        if y < min(y1, y2) or y >= max(y1, y2):
+                            continue
+                        ratio = (y - y1) / (y2 - y1)
+                        intersections.append(x1 + ratio * (x2 - x1))
+                    intersections.sort()
+                    for start, end in zip(intersections[0::2], intersections[1::2]):
+                        image[
+                            y,
+                            max(min_x, int(math.ceil(start))) : min(
+                                max_x, int(math.floor(end))
+                            )
+                            + 1,
+                        ] = color
+            return image
+
+        @staticmethod
+        def GaussianBlur(image, _ksize, _sigma):
+            return image.copy()
+
+        @staticmethod
+        def warpAffine(image, matrix, size):
+            width, height = size
+            output = np.zeros((height, width, image.shape[2]), dtype=image.dtype)
+            linear = np.vstack([matrix, [0.0, 0.0, 1.0]])
+            inv = np.linalg.inv(linear)
+            for y in range(height):
+                for x in range(width):
+                    src_x, src_y, _ = inv @ np.array([x, y, 1.0], dtype=np.float32)
+                    src_x = int(round(src_x))
+                    src_y = int(round(src_y))
+                    if 0 <= src_x < image.shape[1] and 0 <= src_y < image.shape[0]:
+                        output[y, x] = image[src_y, src_x]
+            return output
+
+        @staticmethod
+        def imwrite(path, image):
+            with open(path, "wb") as handle:
+                handle.write(b"P6\n")
+                handle.write(
+                    f"{image.shape[1]} {image.shape[0]}\n255\n".encode("ascii")
+                )
+                handle.write(np.asarray(image, dtype=np.uint8)[:, :, ::-1].tobytes())
+            return True
+
+        @staticmethod
+        def flip(image, mode):
+            if mode == 1:
+                return image[:, ::-1].copy()
+            return image[::-1].copy()
+
+        @staticmethod
+        def namedWindow(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def setWindowProperty(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def waitKey(*_args, **_kwargs):
+            return -1
+
+        @staticmethod
+        def imshow(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def destroyAllWindows():
+            return None
+
+    cv2 = _CV2Fallback()
 
 from config import *
 
 # ---------------------------------------------------------------------------
 # MediaPipe Task API setup (0.10.33+)
 # ---------------------------------------------------------------------------
-import mediapipe as mp
-from mediapipe.tasks import python as mp_tasks
-from mediapipe.tasks.python import vision
+_mediapipe_spec = importlib.util.find_spec("mediapipe")
+if _mediapipe_spec is not None:
+    mp = importlib.import_module("mediapipe")
+    mp_tasks = importlib.import_module("mediapipe.tasks.python")
+    vision = importlib.import_module("mediapipe.tasks.python.vision")
+    _MEDIAPIPE_AVAILABLE = True
+else:
+    mp = None
+    mp_tasks = None
+    vision = None
+    _MEDIAPIPE_AVAILABLE = False
+
+
+class CaptureLike(Protocol):
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]: ...
+
+    def release(self) -> None: ...
+
+    def isOpened(self) -> bool: ...
+
+    def set(self, *_args: object, **_kwargs: object) -> bool: ...
+
+    def get(self, *_args: object, **_kwargs: object) -> float: ...
+
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
@@ -44,6 +378,7 @@ PINKY_PIP = 18
 
 SOUND_SAMPLE_RATE = 22050
 STAMP_SEQUENCE = ("star", "heart", "circle", "smiley")
+SHAPE_HUNT_SEQUENCE = ("circle", "triangle", "square", "star")
 SOUND_EVENT_FREQUENCIES = {
     "draw_start": 392,
     "color_change": 523,
@@ -62,7 +397,7 @@ def download_model():
 
 
 class CameraThread:
-    def __init__(self, cap: cv2.VideoCapture):
+    def __init__(self, cap: "CaptureLike"):
         self._cap = cap
         self._frame: Optional[np.ndarray] = None
         self._new_frame = False
@@ -277,12 +612,12 @@ class SoundEngine:
                     pass
 
 
-_sounddevice = None
-try:
-    import sounddevice as _sounddevice
-
+_sounddevice_spec = importlib.util.find_spec("sounddevice")
+if _sounddevice_spec is not None:
+    _sounddevice = importlib.import_module("sounddevice")
     _SOUNDDEVICE_AVAILABLE = True
-except ImportError:
+else:
+    _sounddevice = None
     _SOUNDDEVICE_AVAILABLE = False
 
 
@@ -393,6 +728,167 @@ def generate_theme_background(theme: str, width: int, height: int) -> np.ndarray
             bg[y, x] = (b, g, 15)
         return bg
     return np.full((height, width, 3), CANVAS_BG_COLOR, dtype=np.uint8)
+
+
+def compute_draw_alive_transform(
+    now: float, last_draw_time: float, delay: float
+) -> Tuple[int, int, float]:
+    idle_time = now - last_draw_time
+    if idle_time < delay:
+        return 0, 0, 1.0
+    phase_time = idle_time - delay
+    phase = 2 * math.pi * DRAW_ALIVE_FREQUENCY * phase_time
+    shift_x = int(round(DRAW_ALIVE_SHIFT_PX * math.sin(phase)))
+    shift_y = int(round(DRAW_ALIVE_SHIFT_PX * math.cos(phase * 0.7)))
+    scale = 1.0 + DRAW_ALIVE_BREATHE_SCALE * math.sin(phase * 0.5)
+    return shift_x, shift_y, scale
+
+
+def compute_mask_coverage(
+    target_mask: np.ndarray, user_delta_mask: np.ndarray
+) -> float:
+    target_pixels = int(np.count_nonzero(target_mask))
+    if target_pixels == 0:
+        return 0.0
+    overlap_pixels = int(np.count_nonzero((target_mask > 0) & (user_delta_mask > 0)))
+    return overlap_pixels / float(target_pixels)
+
+
+def next_shape_hunt_size(current_size: int, min_size: int = SHAPE_HUNT_MIN_SIZE) -> int:
+    return max(min_size, current_size - SHAPE_HUNT_SHRINK_STEP)
+
+
+def compose_art_layers(
+    background: np.ndarray,
+    stroke_layer: np.ndarray,
+    stroke_mask: np.ndarray,
+    stamp_layer: np.ndarray,
+    stamp_mask: np.ndarray,
+) -> np.ndarray:
+    composite = background.copy()
+    stroke_mask_3ch = cv2.merge([stroke_mask, stroke_mask, stroke_mask])
+    composite = np.where(stroke_mask_3ch > 0, stroke_layer, composite)
+    stamp_mask_3ch = cv2.merge([stamp_mask, stamp_mask, stamp_mask])
+    composite = np.where(stamp_mask_3ch > 0, stamp_layer, composite)
+    return composite
+
+
+def build_export_filepath(export_dir: str, dt: datetime) -> str:
+    return os.path.join(export_dir, dt.strftime("art-%Y-%m-%d-%H%M%S.png"))
+
+
+def create_print_ready_image(art: np.ndarray, date_label: str) -> np.ndarray:
+    height, width = art.shape[:2]
+    upscaled = cv2.resize(
+        art,
+        (width * EXPORT_UPSCALE, height * EXPORT_UPSCALE),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
+    border_size = 20
+    framed = cv2.copyMakeBorder(
+        upscaled,
+        border_size,
+        border_size,
+        border_size,
+        border_size,
+        cv2.BORDER_CONSTANT,
+        value=(0, 200, 255),
+    )
+    cv2.putText(
+        framed,
+        date_label,
+        (border_size, framed.shape[0] - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    return framed
+
+
+def draw_ghost_shape(
+    canvas: np.ndarray,
+    shape_name: str,
+    center: Tuple[int, int],
+    size: int,
+    color: Tuple[int, int, int],
+    thickness: int = 2,
+):
+    cx, cy = center
+    half = max(4, size // 2)
+    if shape_name == "circle":
+        cv2.circle(canvas, center, half, color, thickness, cv2.LINE_AA)
+        return
+    if shape_name == "triangle":
+        points = np.array(
+            [[cx, cy - half], [cx - half, cy + half], [cx + half, cy + half]],
+            dtype=np.int32,
+        )
+        cv2.polylines(canvas, [points.reshape((-1, 1, 2))], True, color, thickness)
+        return
+    if shape_name == "square":
+        cv2.rectangle(
+            canvas, (cx - half, cy - half), (cx + half, cy + half), color, thickness
+        )
+        return
+    outer = half
+    inner = max(2, int(outer * 0.45))
+    points = []
+    for index in range(10):
+        angle = (math.pi / 5 * index) - (math.pi / 2)
+        radius = outer if index % 2 == 0 else inner
+        points.append(
+            [
+                int(cx + math.cos(angle) * radius),
+                int(cy + math.sin(angle) * radius),
+            ]
+        )
+    cv2.polylines(
+        canvas,
+        [np.array(points, dtype=np.int32).reshape((-1, 1, 2))],
+        True,
+        color,
+        thickness,
+    )
+
+
+def generate_target_mask(
+    shape_name: str,
+    center: Tuple[int, int],
+    size: int,
+    canvas_shape: Tuple[int, ...],
+) -> np.ndarray:
+    mask = np.zeros(canvas_shape[:2], dtype=np.uint8)
+    cx, cy = center
+    half = max(4, size // 2)
+    if shape_name == "circle":
+        cv2.circle(mask, center, half, 255, -1)
+        return mask
+    if shape_name == "triangle":
+        points = np.array(
+            [[cx, cy - half], [cx - half, cy + half], [cx + half, cy + half]],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(mask, [points.reshape((-1, 1, 2))], 255)
+        return mask
+    if shape_name == "square":
+        cv2.rectangle(mask, (cx - half, cy - half), (cx + half, cy + half), 255, -1)
+        return mask
+    outer = half
+    inner = max(2, int(outer * 0.45))
+    points = []
+    for index in range(10):
+        angle = (math.pi / 5 * index) - (math.pi / 2)
+        radius = outer if index % 2 == 0 else inner
+        points.append(
+            [
+                int(cx + math.cos(angle) * radius),
+                int(cy + math.sin(angle) * radius),
+            ]
+        )
+    cv2.fillPoly(mask, [np.array(points, dtype=np.int32).reshape((-1, 1, 2))], 255)
+    return mask
 
 
 def draw_penguin(canvas, center: Tuple[int, int], size: int):
@@ -587,6 +1083,9 @@ class HandState:
 
 class AirCanvas:
     def __init__(self):
+        if not _MEDIAPIPE_AVAILABLE:
+            raise RuntimeError("mediapipe is required to run Air Canvas")
+
         download_model()
 
         self.cap = self._open_camera()
@@ -596,14 +1095,15 @@ class AirCanvas:
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("Cannot read from camera")
+        if frame is None:
+            raise RuntimeError("Camera returned an empty frame")
 
         self.camera_thread = CameraThread(self.cap)
         self.camera_thread.start()
 
         self.frame_h, self.frame_w = frame.shape[:2]
-        self.canvas = np.full(
-            (self.frame_h, self.frame_w, 3), CANVAS_BG_COLOR, dtype=np.uint8
-        )
+        self.stroke_layer = np.zeros((self.frame_h, self.frame_w, 3), dtype=np.uint8)
+        self.stamp_layer = np.zeros((self.frame_h, self.frame_w, 3), dtype=np.uint8)
 
         self.left_hand = HandState(LEFT_HAND_COLORS)
         self.right_hand = HandState(RIGHT_HAND_COLORS)
@@ -611,7 +1111,19 @@ class AirCanvas:
         self.rainbow_mode = False
         self.rainbow_hue = 0
         self.particle_system = ParticleSystem(PARTICLE_MAX_COUNT)
-        self.particle_overlay = np.zeros_like(self.canvas)
+        self.particle_overlay = np.zeros_like(self.stroke_layer)
+        self.last_draw_time = time.time()
+        self.draw_alive_active = DRAW_ALIVE_ENABLED
+        self.shape_hunt_active = False
+        self.shape_hunt_shape_idx = 0
+        self.shape_hunt_shape_name = SHAPE_HUNT_SEQUENCE[0]
+        self.shape_hunt_size = SHAPE_HUNT_START_SIZE
+        self.shape_hunt_center = (self.frame_w // 2, self.frame_h // 2)
+        self.shape_hunt_snapshot: Optional[np.ndarray] = None
+        self.shape_hunt_target_mask = np.zeros(
+            (self.frame_h, self.frame_w), dtype=np.uint8
+        )
+        self.export_overlay_until = 0.0
 
         self._music_last_note_left = 0.0
         self._music_last_note_right = 0.0
@@ -632,6 +1144,8 @@ class AirCanvas:
             print("⚠️  snap-to-clear disabled: sounddevice not installed")
 
         # MediaPipe HandLandmarker
+        if vision is None or mp_tasks is None:
+            raise RuntimeError("mediapipe task runtime is unavailable")
         options = vision.HandLandmarkerOptions(
             base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=vision.RunningMode.VIDEO,
@@ -650,7 +1164,140 @@ class AirCanvas:
         print("  🤏 Pinch = Change color")
         print("  ✌️ V-sign = Place sticker")
         print("  🖐️ Open palm (hold 1.5s) = Clear canvas")
-        print("  Press 'r' for rainbow, 's' to save, 'c' to clear, 'q' to quit")
+        print(
+            "  Press 'r' rainbow | 'a' draw alive | 'h' shape hunt | 's' save | 'p' print export | 'c' clear | 'q' quit"
+        )
+
+    @property
+    def canvas(self) -> np.ndarray:
+        return self._compose_current_art()
+
+    @canvas.setter
+    def canvas(self, value: np.ndarray):
+        self.stroke_layer = value.copy()
+
+    def _compose_current_art(self) -> np.ndarray:
+        background = np.full(
+            (self.frame_h, self.frame_w, 3), CANVAS_BG_COLOR, dtype=np.uint8
+        )
+        stroke_mask = self._layer_mask(self.stroke_layer)
+        stamp_mask = self._layer_mask(self.stamp_layer)
+        return compose_art_layers(
+            background,
+            self.stroke_layer,
+            stroke_mask,
+            self.stamp_layer,
+            stamp_mask,
+        )
+
+    def _layer_mask(self, layer: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(layer, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
+        return mask
+
+    def _art_since_snapshot(self) -> np.ndarray:
+        current_art = self._compose_current_art()
+        if self.shape_hunt_snapshot is None:
+            return current_art
+        current_gray = cv2.cvtColor(current_art, cv2.COLOR_BGR2GRAY)
+        snapshot_gray = cv2.cvtColor(self.shape_hunt_snapshot, cv2.COLOR_BGR2GRAY)
+        delta = np.abs(
+            current_gray.astype(np.int16) - snapshot_gray.astype(np.int16)
+        ).astype(np.uint8)
+        _, delta_mask = cv2.threshold(delta, 5, 255, cv2.THRESH_BINARY)
+        return delta_mask
+
+    def _start_shape_hunt(self):
+        self.shape_hunt_active = True
+        margin = max(self.shape_hunt_size // 2 + 20, 30)
+        max_x = max(margin, self.frame_w - margin)
+        max_y = max(margin, self.frame_h - margin)
+        center_x = random.randint(margin, max_x)
+        center_y = random.randint(margin, max_y)
+        self.shape_hunt_shape_name = SHAPE_HUNT_SEQUENCE[
+            self.shape_hunt_shape_idx % len(SHAPE_HUNT_SEQUENCE)
+        ]
+        self.shape_hunt_center = (center_x, center_y)
+        self.shape_hunt_snapshot = self._compose_current_art().copy()
+        self.shape_hunt_target_mask = generate_target_mask(
+            self.shape_hunt_shape_name,
+            self.shape_hunt_center,
+            self.shape_hunt_size,
+            self.shape_hunt_snapshot.shape,
+        )
+
+    def _evaluate_shape_hunt_progress(self) -> float:
+        if not self.shape_hunt_active:
+            return 0.0
+        delta_mask = self._art_since_snapshot()
+        coverage = compute_mask_coverage(self.shape_hunt_target_mask, delta_mask)
+        if coverage >= SHAPE_HUNT_SUCCESS_COVERAGE:
+            self.particle_system.emit(
+                self.shape_hunt_center,
+                (0, 220, 255),
+                PARTICLE_EMIT_COUNT * 4,
+            )
+            self.sound_engine.play("stamp")
+            self.shape_hunt_shape_idx = (self.shape_hunt_shape_idx + 1) % len(
+                SHAPE_HUNT_SEQUENCE
+            )
+            self.shape_hunt_size = next_shape_hunt_size(self.shape_hunt_size)
+            self._start_shape_hunt()
+        return coverage
+
+    def _draw_shape_hunt_overlay(self, display: np.ndarray):
+        if not self.shape_hunt_active:
+            return
+        ghost_layer = np.zeros_like(display)
+        draw_ghost_shape(
+            ghost_layer,
+            self.shape_hunt_shape_name,
+            self.shape_hunt_center,
+            self.shape_hunt_size,
+            (120, 120, 120),
+            SHAPE_HUNT_TARGET_THICKNESS,
+        )
+        cv2.addWeighted(display, 1.0, ghost_layer, 0.35, 0, display)
+        coverage = self._evaluate_shape_hunt_progress()
+        cv2.putText(
+            display,
+            f"HUNT {int(coverage * 100)}%",
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def _visible_stroke_layer(self, now: float) -> np.ndarray:
+        if not self.draw_alive_active:
+            return self.stroke_layer
+        shift_x, shift_y, scale = compute_draw_alive_transform(
+            now, self.last_draw_time, DRAW_ALIVE_DELAY
+        )
+        if shift_x == 0 and shift_y == 0 and abs(scale - 1.0) < 1e-6:
+            return self.stroke_layer
+        tx = shift_x + (1.0 - scale) * (self.frame_w / 2.0)
+        ty = shift_y + (1.0 - scale) * (self.frame_h / 2.0)
+        transform = np.array(
+            [[scale, 0.0, tx], [0.0, scale, ty]],
+            dtype=np.float32,
+        )
+        return cv2.warpAffine(
+            self.stroke_layer, transform, (self.frame_w, self.frame_h)
+        )
+
+    def _export_print(self):
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        now = datetime.now()
+        filepath = build_export_filepath(EXPORT_DIR, now)
+        export_image = create_print_ready_image(
+            self._compose_current_art(), now.strftime("%Y-%m-%d")
+        )
+        cv2.imwrite(filepath, export_image)
+        self.export_overlay_until = time.time() + EXPORT_OVERLAY_DURATION
+        print(f"💾 Saved print export: {filepath}")
 
     def _current_draw_color(self, state: HandState) -> Tuple[int, int, int]:
         if not (RAINBOW_ENABLED and self.rainbow_mode):
@@ -660,7 +1307,10 @@ class AirCanvas:
         return color
 
     def _clear_canvas(self):
-        self.canvas[:] = CANVAS_BG_COLOR
+        self.stroke_layer[:] = 0
+        self.stamp_layer[:] = 0
+        self.shape_hunt_snapshot = None
+        self.shape_hunt_target_mask[:] = 0
         self.particle_system.particles.clear()
         self.particle_overlay[:] = 0
         self.sound_engine.play("clear")
@@ -699,7 +1349,7 @@ class AirCanvas:
             state.cursor_thickness = STAMP_SIZE
             return
         stamp_type = STAMP_SEQUENCE[state.stamp_idx % len(STAMP_SEQUENCE)]
-        draw_stamp(self.canvas, center, stamp_type, STAMP_SIZE, state.color)
+        draw_stamp(self.stamp_layer, center, stamp_type, STAMP_SIZE, state.color)
         state.stamp_idx = (state.stamp_idx + 1) % len(STAMP_SEQUENCE)
         state.last_stamp_time = now
         state.cursor_pos = center
@@ -793,16 +1443,17 @@ class AirCanvas:
 
             if state.prev_pos is not None:
                 cv2.line(
-                    self.canvas,
+                    self.stroke_layer,
                     state.prev_pos,
                     smooth_pos,
                     draw_color,
                     thickness,
                     cv2.LINE_AA,
                 )
+                self.last_draw_time = now
 
                 if BRUSH_GLOW:
-                    glow_layer = np.zeros_like(self.canvas)
+                    glow_layer = np.zeros_like(self.stroke_layer)
                     cv2.line(
                         glow_layer,
                         state.prev_pos,
@@ -814,7 +1465,7 @@ class AirCanvas:
                     glow_layer = cv2.GaussianBlur(
                         glow_layer, (0, 0), BRUSH_GLOW_RADIUS // 2
                     )
-                    self.canvas = cv2.add(self.canvas, glow_layer // 3)
+                    self.stroke_layer = cv2.add(self.stroke_layer, glow_layer // 3)
 
                 if PARTICLES_ENABLED:
                     self.particle_system.emit(
@@ -930,9 +1581,21 @@ class AirCanvas:
                 cv2.LINE_AA,
             )
 
+        if time.time() < self.export_overlay_until:
+            cv2.putText(
+                display,
+                "Saved!",
+                (w // 2 - 60, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
+
         cv2.putText(
             display,
-            "Point=Draw | V=Stamp | Fist=Stop | Pinch=Color | Palm=Clear | r=Rain | b=Theme",
+            "Point=Draw | V=Stamp | a=Alive | h=Hunt | p=Print | r=Rain | b=Theme",
             (10, h - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
@@ -970,7 +1633,15 @@ class AirCanvas:
 
                     small_frame = cv2.resize(frame, (640, 480))
                     rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    mp_module = mp
+                    if mp_module is None:
+                        raise RuntimeError(
+                            "mediapipe became unavailable during runtime"
+                        )
+                    mp_image = mp_module.Image(
+                        image_format=mp_module.ImageFormat.SRGB,
+                        data=rgb,
+                    )
                     ts_ms = int(time.monotonic() * 1000)
                     result = self.detector.detect_for_video(mp_image, ts_ms)
 
@@ -992,20 +1663,24 @@ class AirCanvas:
                         if state not in seen_states:
                             state.reset_draw()
 
-                mask = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
-                _, mask = cv2.threshold(mask, 25, 255, cv2.THRESH_BINARY)
-                mask_3ch = cv2.merge([mask, mask, mask])
-
                 current_theme = self.themes[self.theme_idx]
                 if current_theme not in self.theme_bg_cache:
                     self.theme_bg_cache[current_theme] = generate_theme_background(
                         current_theme, self.frame_w, self.frame_h
                     )
-                display = self.theme_bg_cache[current_theme].copy()
-
-                display = np.where(mask_3ch > 0, self.canvas, display)
+                visible_strokes = self._visible_stroke_layer(time.time())
+                stroke_mask = self._layer_mask(visible_strokes)
+                stamp_mask = self._layer_mask(self.stamp_layer)
+                display = compose_art_layers(
+                    self.theme_bg_cache[current_theme],
+                    visible_strokes,
+                    stroke_mask,
+                    self.stamp_layer,
+                    stamp_mask,
+                )
 
                 self._draw_particles(display)
+                self._draw_shape_hunt_overlay(display)
                 self._draw_cursors(display)
                 self._draw_ui(display)
                 cv2.imshow(WINDOW_NAME, display)
@@ -1023,6 +1698,14 @@ class AirCanvas:
                     filename = f"drawing_{int(time.time())}.png"
                     cv2.imwrite(filename, self.canvas)
                     print(f"💾 Saved: {filename}")
+                elif key == EXPORT_KEY:
+                    self._export_print()
+                elif key == DRAW_ALIVE_KEY and DRAW_ALIVE_ENABLED:
+                    self.draw_alive_active = not self.draw_alive_active
+                elif key == SHAPE_HUNT_KEY and SHAPE_HUNT_ENABLED:
+                    self.shape_hunt_active = not self.shape_hunt_active
+                    if self.shape_hunt_active:
+                        self._start_shape_hunt()
                 elif key == RAINBOW_KEY and RAINBOW_ENABLED:
                     self.rainbow_mode = not self.rainbow_mode
                 elif key == THEME_KEY and THEME_ENABLED:
