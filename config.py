@@ -60,6 +60,40 @@ RAINBOW_ENABLED = True
 RAINBOW_KEY = ord("r")
 RAINBOW_HUE_STEP = 3
 
+# Background themes — 'b' key cycles through; default is dark
+BACKGROUND_THEME = "dark"  # Default theme: dark, space, forest, ocean
+THEME_ENABLED = True
+THEME_KEY = ord("b")
+THEMES = ["dark", "space", "forest", "ocean"]  # No camera theme
+
+# Per-theme dot density for subtle static-dot backgrounds
+THEME_DOT_COUNT = {
+    "space": 220,  # Stars — bright tiny dots on deep purple
+    "forest": 160,  # Fireflies/leaves — dim green dots on deep green
+    "ocean": 180,  # Bubbles — soft blue dots on deep blue
+}
+
+# Avatars
+AVATARS_ENABLED = True
+AVATAR_SIZE = 40
+AVATAR_LEFT = "penguin"  # Left hand gets penguin
+AVATAR_RIGHT = "cat"  # Right hand gets cat
+
+# Drawing music — pentatonic scale by color, octave by hand side
+MUSIC_MODE = True
+MUSIC_DRAW_COOLDOWN = 0.35  # Seconds between notes while drawing (per hand)
+MUSIC_MAX_CONCURRENT = 2  # Max simultaneous audio subprocesses
+
+PENTATONIC_NOTES_LOW = [261, 294, 330, 392, 440]
+PENTATONIC_NOTES_HIGH = [523, 587, 659, 784, 880]
+
+# Snap-to-clear via microphone spike
+SNAP_CLEAR_ENABLED = False  # Opt-in; gracefully disabled if sounddevice missing
+SNAP_CLEAR_THRESHOLD = 0.6  # Amplitude threshold (0–1) to trigger clear
+SNAP_CLEAR_COOLDOWN = 2.0  # Seconds between mic-triggered clears
+SNAP_CLEAR_CHUNK = 1024  # Audio frames per mic read
+SNAP_CLEAR_SAMPLE_RATE = 44100  # Mic sample rate
+
 PARTICLES_ENABLED = True
 PARTICLE_MAX_COUNT = 100
 PARTICLE_EMIT_COUNT = 3

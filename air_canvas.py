@@ -210,13 +210,16 @@ def resolve_sound_player() -> Optional[str]:
 
 
 class SoundEngine:
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, max_concurrent: int = MUSIC_MAX_CONCURRENT):
         self.enabled = enabled
         self.player = resolve_sound_player() if enabled else None
         self.tones = {
             name: tone_to_wav_bytes(generate_tone(freq, SOUND_DURATION, SOUND_VOLUME))
             for name, freq in SOUND_EVENT_FREQUENCIES.items()
         }
+        self._active_count = 0
+        self._count_lock = threading.Lock()
+        self._max_concurrent = max_concurrent
 
     def play(self, event_name: str):
         if not self.enabled or self.player is None:
@@ -224,7 +227,25 @@ class SoundEngine:
         tone = self.tones.get(event_name)
         if tone is None:
             return
-        threading.Thread(target=self._play_bytes, args=(tone,), daemon=True).start()
+        self._launch(tone)
+
+    def play_tone(self, frequency: int):
+        if not self.enabled or self.player is None:
+            return
+        with self._count_lock:
+            if self._active_count >= self._max_concurrent:
+                return
+        wav = tone_to_wav_bytes(generate_tone(frequency, SOUND_DURATION, SOUND_VOLUME))
+        self._launch(wav)
+
+    def _launch(self, wav_bytes: bytes):
+        with self._count_lock:
+            if self._active_count >= self._max_concurrent:
+                return
+            self._active_count += 1
+        threading.Thread(
+            target=self._play_bytes, args=(wav_bytes,), daemon=True
+        ).start()
 
     def _play_bytes(self, wav_bytes: bytes):
         temp_path: Optional[str] = None
@@ -247,11 +268,22 @@ class SoundEngine:
         except Exception:
             return
         finally:
+            with self._count_lock:
+                self._active_count -= 1
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
                 except OSError:
                     pass
+
+
+_sounddevice = None
+try:
+    import sounddevice as _sounddevice
+
+    _SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    _SOUNDDEVICE_AVAILABLE = False
 
 
 def draw_star(canvas, center: Tuple[int, int], size: int, color: Tuple[int, int, int]):
@@ -327,6 +359,94 @@ def draw_stamp(
         cv2.circle(canvas, center, max(4, size), color, -1)
         return
     draw_smiley(canvas, center, size, color)
+
+
+def generate_theme_background(theme: str, width: int, height: int) -> np.ndarray:
+    if theme == "dark":
+        return np.full((height, width, 3), CANVAS_BG_COLOR, dtype=np.uint8)
+    if theme == "space":
+        bg = np.full((height, width, 3), (30, 10, 20), dtype=np.uint8)
+        rng = random.Random(42)
+        for _ in range(THEME_DOT_COUNT.get("space", 220)):
+            x = rng.randint(0, width - 1)
+            y = rng.randint(0, height - 1)
+            brightness = rng.randint(140, 230)
+            bg[y, x] = (brightness, brightness, brightness)
+        return bg
+    if theme == "forest":
+        bg = np.full((height, width, 3), (10, 28, 10), dtype=np.uint8)
+        rng = random.Random(7)
+        for _ in range(THEME_DOT_COUNT.get("forest", 160)):
+            x = rng.randint(0, width - 1)
+            y = rng.randint(0, height - 1)
+            g = rng.randint(45, 90)
+            bg[y, x] = (5, g, 5)
+        return bg
+    if theme == "ocean":
+        bg = np.full((height, width, 3), (60, 30, 10), dtype=np.uint8)
+        rng = random.Random(13)
+        for _ in range(THEME_DOT_COUNT.get("ocean", 180)):
+            x = rng.randint(0, width - 1)
+            y = rng.randint(0, height - 1)
+            b = rng.randint(100, 180)
+            g = rng.randint(50, 100)
+            bg[y, x] = (b, g, 15)
+        return bg
+    return np.full((height, width, 3), CANVAS_BG_COLOR, dtype=np.uint8)
+
+
+def draw_penguin(canvas, center: Tuple[int, int], size: int):
+    cx, cy = center
+    # Body
+    cv2.ellipse(
+        canvas, (cx, cy + 5), (size, int(size * 1.2)), 0, 0, 360, (30, 30, 30), -1
+    )
+    # Belly
+    cv2.ellipse(
+        canvas,
+        (cx, cy + 10),
+        (int(size * 0.6), int(size * 0.9)),
+        0,
+        0,
+        360,
+        (240, 240, 240),
+        -1,
+    )
+    # Eyes
+    off_x = size // 3
+    off_y = size // 2
+    cv2.circle(canvas, (cx - off_x, cy - off_y), 4, (255, 255, 255), -1)
+    cv2.circle(canvas, (cx + off_x, cy - off_y), 4, (255, 255, 255), -1)
+    cv2.circle(canvas, (cx - off_x, cy - off_y), 2, (0, 0, 0), -1)
+    cv2.circle(canvas, (cx + off_x, cy - off_y), 2, (0, 0, 0), -1)
+    # Beak
+    pts = np.array([[cx - 4, cy - 5], [cx + 4, cy - 5], [cx, cy + 2]], np.int32)
+    cv2.fillPoly(canvas, [pts], (0, 165, 255))
+
+
+def draw_cat(canvas, center: Tuple[int, int], size: int):
+    cx, cy = center
+    color = (200, 200, 200)
+    # Ears
+    pts_l = np.array(
+        [[cx - size + 5, cy - size], [cx - 5, cy - 5], [cx - size, cy]], np.int32
+    )
+    pts_r = np.array(
+        [[cx + size - 5, cy - size], [cx + 5, cy - 5], [cx + size, cy]], np.int32
+    )
+    cv2.fillPoly(canvas, [pts_l], color)
+    cv2.fillPoly(canvas, [pts_r], color)
+    # Head
+    cv2.circle(canvas, (cx, cy), size - 2, color, -1)
+    # Eyes
+    off_x = size // 3
+    off_y = size // 4
+    cv2.circle(canvas, (cx - off_x, cy - off_y), 4, (0, 255, 0), -1)
+    cv2.circle(canvas, (cx + off_x, cy - off_y), 4, (0, 255, 0), -1)
+    cv2.circle(canvas, (cx - off_x, cy - off_y), 1, (0, 0, 0), -1)
+    cv2.circle(canvas, (cx + off_x, cy - off_y), 1, (0, 0, 0), -1)
+    # Nose
+    cv2.circle(canvas, (cx, cy + 5), 3, (150, 100, 255), -1)
 
 
 @dataclass
@@ -493,6 +613,24 @@ class AirCanvas:
         self.particle_system = ParticleSystem(PARTICLE_MAX_COUNT)
         self.particle_overlay = np.zeros_like(self.canvas)
 
+        self._music_last_note_left = 0.0
+        self._music_last_note_right = 0.0
+
+        default_idx = (
+            THEMES.index(BACKGROUND_THEME) if BACKGROUND_THEME in THEMES else 0
+        )
+        self.theme_idx = default_idx
+        self.themes = THEMES if THEME_ENABLED else ["dark"]
+        self.theme_bg_cache: dict = {}
+
+        self.snap_clear_event = threading.Event()
+        self._snap_clear_last = 0.0
+        self._snap_clear_active = SNAP_CLEAR_ENABLED and _SOUNDDEVICE_AVAILABLE
+        if self._snap_clear_active:
+            threading.Thread(target=self._mic_listener, daemon=True).start()
+        elif SNAP_CLEAR_ENABLED and not _SOUNDDEVICE_AVAILABLE:
+            print("⚠️  snap-to-clear disabled: sounddevice not installed")
+
         # MediaPipe HandLandmarker
         options = vision.HandLandmarkerOptions(
             base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
@@ -528,6 +666,33 @@ class AirCanvas:
         self.sound_engine.play("clear")
         print("🧹 Canvas cleared!")
 
+    def _mic_listener(self):
+        import numpy as _np
+
+        rec = getattr(_sounddevice, "rec", None)
+        if rec is None:
+            return
+
+        while True:
+            try:
+                chunk = rec(
+                    SNAP_CLEAR_CHUNK,
+                    samplerate=SNAP_CLEAR_SAMPLE_RATE,
+                    channels=1,
+                    dtype="float32",
+                    blocking=True,
+                )
+                amplitude = float(_np.abs(chunk).max())
+                now = time.time()
+                if (
+                    amplitude >= SNAP_CLEAR_THRESHOLD
+                    and now - self._snap_clear_last >= SNAP_CLEAR_COOLDOWN
+                ):
+                    self._snap_clear_last = now
+                    self.snap_clear_event.set()
+            except Exception:
+                time.sleep(0.1)
+
     def _place_stamp(self, state: HandState, center: Tuple[int, int], now: float):
         if not STICKERS_ENABLED or now - state.last_stamp_time < STAMP_COOLDOWN:
             state.cursor_pos = center
@@ -559,7 +724,6 @@ class AirCanvas:
         cv2.add(display, self.particle_overlay, dst=display)
 
     def _open_camera(self):
-        """Open built-in camera, skip iPhone Continuity Camera."""
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FPS, 30)
@@ -583,6 +747,7 @@ class AirCanvas:
     def _process_hand(self, landmarks, handedness: str, frame):
         is_left = handedness == "Left"
         state = self.right_hand if is_left else self.left_hand
+        is_state_left = state is self.left_hand
 
         now = time.time()
         pos = fingertip_pos(landmarks, self.frame_w, self.frame_h)
@@ -658,6 +823,21 @@ class AirCanvas:
                         PARTICLE_EMIT_COUNT,
                     )
 
+                if MUSIC_MODE:
+                    notes = (
+                        PENTATONIC_NOTES_LOW if is_state_left else PENTATONIC_NOTES_HIGH
+                    )
+                    freq = notes[state.color_idx % len(notes)]
+                    last_attr = (
+                        "_music_last_note_left"
+                        if is_state_left
+                        else "_music_last_note_right"
+                    )
+                    last_t = getattr(self, last_attr)
+                    if now - last_t >= MUSIC_DRAW_COOLDOWN:
+                        setattr(self, last_attr, now)
+                        self.sound_engine.play_tone(freq)
+
             state.prev_pos = smooth_pos
             state.drawing = True
             state.cursor_pos = smooth_pos
@@ -676,6 +856,14 @@ class AirCanvas:
                 state.color,
                 2,
             )
+            if AVATARS_ENABLED:
+                is_left = state is self.left_hand
+                avatar = AVATAR_LEFT if is_left else AVATAR_RIGHT
+                pos = (state.cursor_pos[0], state.cursor_pos[1] - 40)
+                if avatar == "penguin":
+                    draw_penguin(display, pos, AVATAR_SIZE // 2)
+                elif avatar == "cat":
+                    draw_cat(display, pos, AVATAR_SIZE // 2)
 
     def _draw_ui(self, display):
         h, w = display.shape[:2]
@@ -717,6 +905,19 @@ class AirCanvas:
             2,
         )
 
+        if THEME_ENABLED:
+            theme_name = self.themes[self.theme_idx].upper()
+            cv2.putText(
+                display,
+                f"THEME: {theme_name}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (200, 200, 200),
+                1,
+                cv2.LINE_AA,
+            )
+
         if RAINBOW_ENABLED and self.rainbow_mode:
             cv2.putText(
                 display,
@@ -731,7 +932,7 @@ class AirCanvas:
 
         cv2.putText(
             display,
-            "Point=Draw | V=Stamp | Fist=Stop | Pinch=Color | Palm=Clear | r=Rainbow",
+            "Point=Draw | V=Stamp | Fist=Stop | Pinch=Color | Palm=Clear | r=Rain | b=Theme",
             (10, h - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
@@ -795,13 +996,23 @@ class AirCanvas:
                 _, mask = cv2.threshold(mask, 25, 255, cv2.THRESH_BINARY)
                 mask_3ch = cv2.merge([mask, mask, mask])
 
-                display = frame.copy()
+                current_theme = self.themes[self.theme_idx]
+                if current_theme not in self.theme_bg_cache:
+                    self.theme_bg_cache[current_theme] = generate_theme_background(
+                        current_theme, self.frame_w, self.frame_h
+                    )
+                display = self.theme_bg_cache[current_theme].copy()
+
                 display = np.where(mask_3ch > 0, self.canvas, display)
 
                 self._draw_particles(display)
                 self._draw_cursors(display)
                 self._draw_ui(display)
                 cv2.imshow(WINDOW_NAME, display)
+
+                if self.snap_clear_event.is_set():
+                    self.snap_clear_event.clear()
+                    self._clear_canvas()
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == QUIT_KEY:
@@ -814,6 +1025,10 @@ class AirCanvas:
                     print(f"💾 Saved: {filename}")
                 elif key == RAINBOW_KEY and RAINBOW_ENABLED:
                     self.rainbow_mode = not self.rainbow_mode
+                elif key == THEME_KEY and THEME_ENABLED:
+                    self.theme_idx = (self.theme_idx + 1) % len(self.themes)
+                    self.particle_system.particles.clear()
+                    self.particle_overlay[:] = 0
         finally:
             self.camera_thread.stop()
             self.detector.close()
