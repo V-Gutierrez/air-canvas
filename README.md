@@ -8,6 +8,10 @@ No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn 
   <img src="assets/demo.jpg" alt="Father and son painting in the air together" width="600">
 </p>
 
+<p align="center">
+  <img src="assets/demo-usage.jpg" alt="Air Canvas in action — drawing on screen" width="600">
+</p>
+
 Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, flash a V-sign to stamp playful shapes, and toggle rainbow mode for extra color. Two hands, eight colors, infinite imagination.
 
 Built for kids who deserve to create without consuming.
