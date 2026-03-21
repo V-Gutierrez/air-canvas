@@ -1,8 +1,8 @@
 # Air Canvas 🎨
 
-**Digital toy for kids — paint in the air with your hands.**
+**Low-stimulus digital toy for kids — paint in the air with your hands.**
 
-No screens to scroll. No likes to chase. No feeds to compare. Just pure creativity, drawn in the air.
+No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn in the air.
 
 Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, close your fist to pause. Two hands, eight colors, infinite imagination.
 
