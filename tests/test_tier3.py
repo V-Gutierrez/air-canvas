@@ -125,12 +125,16 @@ class PrintExportTests(unittest.TestCase):
         canvas.frame_h = 10
         canvas.canvas = np.full((10, 20, 3), 150, dtype=np.uint8)
         canvas.stamp_layer = np.zeros((10, 20, 3), dtype=np.uint8)
+        canvas.sound_engine = mock.Mock()
+        canvas.save_overlay_until = 0.0
+        canvas.save_flash_until = 0.0
+        canvas.save_overlay_path = ""
+        canvas.save_overlay_thumbnail = None
         canvas.theme_idx = 0
         canvas.themes = ["dark"]
         canvas.theme_bg_cache = {
             "dark": np.full((10, 20, 3), config.CANVAS_BG_COLOR, dtype=np.uint8)
         }
-        canvas.export_overlay_until = 0.0
 
         fixed_now = datetime(2026, 3, 21, 14, 5, 6)
         frozen_time = 100.0
@@ -146,7 +150,12 @@ class PrintExportTests(unittest.TestCase):
 
             expected_path = os.path.join(tmpdir, "art-2026-03-21-140506.png")
             self.assertTrue(os.path.exists(expected_path))
-            self.assertGreater(canvas.export_overlay_until, frozen_time)
+            self.assertGreater(canvas.save_overlay_until, frozen_time)
+            self.assertGreater(canvas.save_flash_until, frozen_time)
+            self.assertTrue(
+                canvas.save_overlay_path.endswith("art-2026-03-21-140506.png")
+            )
+            canvas.sound_engine.play.assert_called_once_with("save")
 
 
 class LayerCompositionTests(unittest.TestCase):

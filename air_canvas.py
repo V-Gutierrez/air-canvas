@@ -384,6 +384,7 @@ SOUND_EVENT_FREQUENCIES = {
     "color_change": 523,
     "clear": 262,
     "stamp": 659,
+    "save": 784,
 }
 
 
@@ -459,10 +460,18 @@ def is_fist(landmarks) -> bool:
     )
 
 
-def is_open_palm(landmarks) -> bool:
+def is_thumb_extended(landmarks, handedness: str) -> bool:
+    thumb_delta = landmarks[THUMB_TIP].x - landmarks[THUMB_IP].x
+    if handedness == "Left":
+        return thumb_delta < -THUMB_EXTENSION_THRESHOLD
+    return thumb_delta > THUMB_EXTENSION_THRESHOLD
+
+
+def is_open_palm(landmarks, handedness: str) -> bool:
     """All 5 fingers extended."""
     return (
-        is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
+        is_thumb_extended(landmarks, handedness)
+        and is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
         and is_finger_extended(landmarks, MIDDLE_TIP, MIDDLE_PIP)
         and is_finger_extended(landmarks, RING_TIP, RING_PIP)
         and is_finger_extended(landmarks, PINKY_TIP, PINKY_PIP)
@@ -773,8 +782,31 @@ def compose_art_layers(
     return composite
 
 
-def build_export_filepath(export_dir: str, dt: datetime) -> str:
-    return os.path.join(export_dir, dt.strftime("art-%Y-%m-%d-%H%M%S.png"))
+def darken_frame(frame: np.ndarray, alpha: float) -> np.ndarray:
+    if alpha <= 0:
+        return frame.copy()
+    return cv2.addWeighted(
+        frame,
+        max(0.0, 1.0 - alpha),
+        np.zeros_like(frame),
+        min(1.0, alpha),
+        0,
+    )
+
+
+def build_export_filepath(export_dir: str, dt: datetime, prefix: str = "art") -> str:
+    return os.path.join(export_dir, dt.strftime(f"{prefix}-%Y-%m-%d-%H%M%S.png"))
+
+
+def display_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return path.replace(home, "~", 1)
+    return path
+
+
+def build_save_thumbnail(image: np.ndarray) -> np.ndarray:
+    return cv2.resize(image, (SAVE_THUMBNAIL_WIDTH, SAVE_THUMBNAIL_HEIGHT))
 
 
 def create_print_ready_image(art: np.ndarray, date_label: str) -> np.ndarray:
@@ -1029,6 +1061,13 @@ class HandState:
         self.cursor_thickness = BRUSH_MIN_THICKNESS
         self.last_stamp_time = 0.0
         self.stamp_idx = 0
+        self.palette_hover_idx: Optional[int] = None
+        self.palette_hover_start: Optional[float] = None
+        self.palette_pop_until = 0.0
+        self.selected_stamp: Optional[str] = None
+        self.stamp_hover_idx: Optional[int] = None
+        self.open_palm_progress = 0.0
+        self.clear_indicator_pos: Optional[Tuple[int, int]] = None
 
     @property
     def color(self) -> Tuple[int, int, int]:
@@ -1036,6 +1075,32 @@ class HandState:
 
     def cycle_color(self):
         self.color_idx = (self.color_idx + 1) % len(self.colors)
+
+    def set_color_idx(self, idx: int, now: float):
+        self.color_idx = idx % len(self.colors)
+        self.palette_pop_until = now + 0.18
+
+    def reset_open_palm(self):
+        self.open_palm_start = None
+        self.open_palm_progress = 0.0
+        self.clear_indicator_pos = None
+
+    def reset_palette_hover(self):
+        self.palette_hover_idx = None
+        self.palette_hover_start = None
+
+    def reset_stamp_selection(self):
+        self.selected_stamp = None
+        self.stamp_hover_idx = None
+
+    def reset_stroke(self):
+        self.prev_pos = None
+        self.smooth_x = None
+        self.smooth_y = None
+        self.prev_wrist_pos = None
+        self.speed = 0.0
+        self.drawing = False
+        self.cursor_pos = None
 
     def smooth(self, x: int, y: int) -> Tuple[int, int]:
         if self.smooth_x is None or self.smooth_y is None:
@@ -1066,14 +1131,10 @@ class HandState:
             )
 
     def reset_draw(self):
-        self.prev_pos = None
-        self.smooth_x = None
-        self.smooth_y = None
-        self.prev_wrist_pos = None
-        self.speed = 0.0
-        self.open_palm_start = None
-        self.drawing = False
-        self.cursor_pos = None
+        self.reset_stroke()
+        self.reset_open_palm()
+        self.reset_palette_hover()
+        self.reset_stamp_selection()
 
 
 # ---------------------------------------------------------------------------
@@ -1123,7 +1184,10 @@ class AirCanvas:
         self.shape_hunt_target_mask = np.zeros(
             (self.frame_h, self.frame_w), dtype=np.uint8
         )
-        self.export_overlay_until = 0.0
+        self.save_overlay_until = 0.0
+        self.save_flash_until = 0.0
+        self.save_overlay_path = ""
+        self.save_overlay_thumbnail: Optional[np.ndarray] = None
 
         self._music_last_note_left = 0.0
         self._music_last_note_right = 0.0
@@ -1167,6 +1231,98 @@ class AirCanvas:
         print(
             "  Press 'r' rainbow | 'a' draw alive | 'h' shape hunt | 's' save | 'p' print export | 'c' clear | 'q' quit"
         )
+
+    def _palette_positions(self, state: HandState) -> List[Tuple[int, int]]:
+        x = (
+            PALETTE_EDGE_MARGIN + PALETTE_CIRCLE_RADIUS
+            if state is self.left_hand
+            else self.frame_w - PALETTE_EDGE_MARGIN - PALETTE_CIRCLE_RADIUS
+        )
+        total_height = (
+            len(state.colors) * (PALETTE_CIRCLE_RADIUS * 2)
+            + (len(state.colors) - 1) * PALETTE_VERTICAL_GAP
+        )
+        start_y = max(STAMP_SHELF_HEIGHT + 50, (self.frame_h - total_height) // 2)
+        spacing = PALETTE_CIRCLE_RADIUS * 2 + PALETTE_VERTICAL_GAP
+        return [(x, start_y + index * spacing) for index in range(len(state.colors))]
+
+    def _detect_palette_hover(
+        self, state: HandState, pos: Tuple[int, int]
+    ) -> Optional[int]:
+        for idx, center in enumerate(self._palette_positions(state)):
+            if (
+                math.hypot(pos[0] - center[0], pos[1] - center[1])
+                <= PALETTE_CIRCLE_RADIUS * 1.45
+            ):
+                return idx
+        return None
+
+    def _update_palette_hover(
+        self, state: HandState, pos: Tuple[int, int], now: float
+    ) -> bool:
+        hover_idx = self._detect_palette_hover(state, pos)
+        if hover_idx is None:
+            state.reset_palette_hover()
+            return False
+        if state.palette_hover_idx != hover_idx:
+            state.palette_hover_idx = hover_idx
+            state.palette_hover_start = now
+            return True
+        if (
+            state.palette_hover_start is not None
+            and now - state.palette_hover_start >= PALETTE_DWELL_TIME
+        ):
+            if state.color_idx != hover_idx:
+                state.set_color_idx(hover_idx, now)
+                self.sound_engine.play("color_change")
+            state.palette_hover_start = now
+        return True
+
+    def _stamp_shelf_items(self) -> List[str]:
+        return list(STAMP_SEQUENCE)
+
+    def _stamp_shelf_centers(self) -> List[Tuple[int, int]]:
+        items = self._stamp_shelf_items()
+        step = STAMP_ICON_SIZE * 2 + STAMP_ICON_GAP
+        total_width = (
+            len(items) * STAMP_ICON_SIZE * 2 + (len(items) - 1) * STAMP_ICON_GAP
+        )
+        start_x = max(50, (self.frame_w - total_width) // 2 + STAMP_ICON_SIZE)
+        y = STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT // 2
+        return [(start_x + idx * step, y) for idx in range(len(items))]
+
+    def _detect_stamp_hover(self, pos: Tuple[int, int]) -> Optional[int]:
+        for idx, center in enumerate(self._stamp_shelf_centers()):
+            if (
+                math.hypot(pos[0] - center[0], pos[1] - center[1])
+                <= STAMP_ICON_SIZE * 1.4
+            ):
+                return idx
+        return None
+
+    def _current_stamp_type(self, state: HandState) -> str:
+        if state.selected_stamp is not None:
+            return state.selected_stamp
+        return STAMP_SEQUENCE[state.stamp_idx % len(STAMP_SEQUENCE)]
+
+    def _save_art(self, include_frame: bool = False):
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        now_dt = datetime.now()
+        filepath = build_export_filepath(EXPORT_DIR, now_dt)
+        art = self._compose_current_art()
+        image = (
+            create_print_ready_image(art, now_dt.strftime("%Y-%m-%d"))
+            if include_frame
+            else art
+        )
+        cv2.imwrite(filepath, image)
+        self.save_overlay_until = time.time() + SAVE_OVERLAY_DURATION
+        self.save_flash_until = time.time() + SAVE_FLASH_DURATION
+        self.save_overlay_path = display_path(filepath)
+        self.save_overlay_thumbnail = build_save_thumbnail(art)
+        self.sound_engine.play("save")
+        print(f"💾 Saved art: {filepath}")
+        return filepath
 
     @property
     def canvas(self) -> np.ndarray:
@@ -1289,15 +1445,7 @@ class AirCanvas:
         )
 
     def _export_print(self):
-        os.makedirs(EXPORT_DIR, exist_ok=True)
-        now = datetime.now()
-        filepath = build_export_filepath(EXPORT_DIR, now)
-        export_image = create_print_ready_image(
-            self._compose_current_art(), now.strftime("%Y-%m-%d")
-        )
-        cv2.imwrite(filepath, export_image)
-        self.export_overlay_until = time.time() + EXPORT_OVERLAY_DURATION
-        print(f"💾 Saved print export: {filepath}")
+        return self._save_art(include_frame=True)
 
     def _current_draw_color(self, state: HandState) -> Tuple[int, int, int]:
         if not (RAINBOW_ENABLED and self.rainbow_mode):
@@ -1348,13 +1496,179 @@ class AirCanvas:
             state.cursor_pos = center
             state.cursor_thickness = STAMP_SIZE
             return
-        stamp_type = STAMP_SEQUENCE[state.stamp_idx % len(STAMP_SEQUENCE)]
+        stamp_type = self._current_stamp_type(state)
         draw_stamp(self.stamp_layer, center, stamp_type, STAMP_SIZE, state.color)
-        state.stamp_idx = (state.stamp_idx + 1) % len(STAMP_SEQUENCE)
+        if state.selected_stamp is None:
+            state.stamp_idx = (state.stamp_idx + 1) % len(STAMP_SEQUENCE)
         state.last_stamp_time = now
         state.cursor_pos = center
         state.cursor_thickness = STAMP_SIZE
         self.sound_engine.play("stamp")
+
+    def _draw_stamp_preview(
+        self,
+        display: np.ndarray,
+        center: Tuple[int, int],
+        stamp_type: str,
+        color: Tuple[int, int, int],
+    ):
+        preview = np.zeros_like(display)
+        draw_stamp(preview, center, stamp_type, STAMP_SIZE, color)
+        cv2.addWeighted(display, 1.0, preview, STAMP_PREVIEW_ALPHA, 0, display)
+
+    def _draw_clear_progress(self, display: np.ndarray, state: HandState):
+        if state.clear_indicator_pos is None or state.open_palm_progress <= 0:
+            return
+        radius = 42
+        cv2.circle(display, state.clear_indicator_pos, radius, (255, 255, 255), 2)
+        cv2.ellipse(
+            display,
+            state.clear_indicator_pos,
+            (radius, radius),
+            -90,
+            0,
+            int(360 * min(1.0, state.open_palm_progress)),
+            (120, 240, 255),
+            6,
+        )
+
+    def _draw_color_blob(
+        self,
+        display: np.ndarray,
+        center: Tuple[int, int],
+        color: Tuple[int, int, int],
+        pulse: float,
+    ):
+        outer = max(10, int(HAND_COLOR_BLOB_RADIUS + pulse * 5))
+        cv2.circle(display, center, outer, tuple(min(255, c + 35) for c in color), -1)
+        cv2.circle(display, center, max(8, outer - 16), color, -1)
+        cv2.circle(display, center, outer, (255, 255, 255), 3)
+
+    def _draw_palette(self, display: np.ndarray, state: HandState, now: float):
+        for idx, center in enumerate(self._palette_positions(state)):
+            color = state.colors[idx]
+            radius = PALETTE_CIRCLE_RADIUS
+            if state.palette_hover_idx == idx:
+                radius = int(radius * 1.18)
+            if state.color_idx == idx and state.palette_pop_until > now:
+                radius = int(radius * 1.35)
+            cv2.circle(display, center, radius + 8, (255, 255, 255), 2)
+            cv2.circle(display, center, radius, color, -1)
+            if state.color_idx == idx:
+                cv2.circle(display, center, radius + 13, (120, 240, 255), 4)
+            if state.palette_hover_idx == idx and state.palette_hover_start is not None:
+                dwell = min(1.0, (now - state.palette_hover_start) / PALETTE_DWELL_TIME)
+                cv2.ellipse(
+                    display,
+                    center,
+                    (radius + 18, radius + 18),
+                    -90,
+                    0,
+                    int(360 * dwell),
+                    (255, 255, 255),
+                    4,
+                )
+
+    def _draw_stamp_shelf(self, display: np.ndarray):
+        shelf = np.zeros_like(display)
+        cv2.rectangle(
+            shelf,
+            (30, STAMP_SHELF_TOP_MARGIN),
+            (self.frame_w - 30, STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT),
+            (45, 45, 60),
+            -1,
+        )
+        cv2.addWeighted(display, 1.0, shelf, 0.55, 0, display)
+        for idx, (stamp_type, center) in enumerate(
+            zip(self._stamp_shelf_items(), self._stamp_shelf_centers())
+        ):
+            scale = (
+                1.25
+                if self.left_hand.stamp_hover_idx == idx
+                or self.right_hand.stamp_hover_idx == idx
+                else 1.0
+            )
+            selected = (
+                self.left_hand.selected_stamp == stamp_type
+                or self.right_hand.selected_stamp == stamp_type
+            )
+            icon_radius = int(STAMP_ICON_SIZE * scale)
+            cv2.circle(display, center, icon_radius + 10, (255, 255, 255), 2)
+            if selected:
+                cv2.circle(display, center, icon_radius + 15, (120, 240, 255), 4)
+            draw_stamp(display, center, stamp_type, icon_radius, (255, 230, 120))
+
+    def _draw_rainbow_arc(self, display: np.ndarray):
+        if not self.rainbow_mode:
+            return
+        center = (self.frame_w // 2, 0)
+        radius = max(120, self.frame_w // 5)
+        for step in range(12):
+            start = 180 + step * 15
+            end = start + 16
+            cv2.ellipse(
+                display,
+                center,
+                (radius, radius),
+                0,
+                start,
+                end,
+                hue_to_bgr((self.rainbow_hue + step * 15) % 180),
+                RAINBOW_ARC_THICKNESS,
+            )
+
+    def _draw_save_overlay(self, display: np.ndarray, now: float):
+        if now >= self.save_overlay_until:
+            return
+        overlay = display.copy()
+        panel_width = 460
+        panel_height = 170
+        x1 = max(20, self.frame_w - panel_width - 30)
+        y1 = max(20, self.frame_h - panel_height - 30)
+        x2 = x1 + panel_width
+        y2 = y1 + panel_height
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (35, 35, 45), -1)
+        cv2.addWeighted(display, 1.0, overlay, 0.72, 0, display)
+        if self.save_overlay_thumbnail is not None:
+            thumb_h, thumb_w = self.save_overlay_thumbnail.shape[:2]
+            display[y1 + 20 : y1 + 20 + thumb_h, x1 + 20 : x1 + 20 + thumb_w] = (
+                self.save_overlay_thumbnail
+            )
+            cv2.rectangle(
+                display,
+                (x1 + 20, y1 + 20),
+                (x1 + 20 + thumb_w, y1 + 20 + thumb_h),
+                (255, 255, 255),
+                2,
+            )
+        cv2.putText(
+            display,
+            "Saved! ✨",
+            (x1 + 205, y1 + 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (120, 255, 180),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display,
+            self.save_overlay_path,
+            (x1 + 205, y1 + 110),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def _apply_save_flash(self, display: np.ndarray, now: float):
+        if now >= self.save_flash_until:
+            return
+        remaining = max(0.0, self.save_flash_until - now)
+        alpha = min(0.9, remaining / SAVE_FLASH_DURATION)
+        flash = np.full_like(display, 255)
+        cv2.addWeighted(display, 1.0 - alpha, flash, alpha, 0, display)
 
     def _fade_particle_overlay(self):
         self.particle_overlay = cv2.addWeighted(
@@ -1402,28 +1716,52 @@ class AirCanvas:
         now = time.time()
         pos = fingertip_pos(landmarks, self.frame_w, self.frame_h)
         state.calc_speed(landmarks[INDEX_TIP].x, landmarks[INDEX_TIP].y)
+        state.cursor_pos = pos
+        state.clear_indicator_pos = pos
+
+        hovering_palette = self._update_palette_hover(state, pos, now)
+        state.stamp_hover_idx = self._detect_stamp_hover(pos)
+
+        if is_open_palm(landmarks, handedness):
+            if state.speed < CLEAR_STILLNESS:
+                if state.open_palm_start is None:
+                    state.open_palm_start = now
+                state.open_palm_progress = min(
+                    1.0, (now - state.open_palm_start) / CLEAR_HOLD_TIME
+                )
+                if state.open_palm_progress >= 1.0:
+                    self._clear_canvas()
+                    state.reset_draw()
+                    return
+            else:
+                state.reset_open_palm()
+            state.reset_stroke()
+            return
+        state.reset_open_palm()
+
+        if is_fist(landmarks):
+            state.reset_stroke()
+            state.reset_stamp_selection()
+            return
+
+        if hovering_palette:
+            state.reset_stroke()
+            return
+
+        if state.stamp_hover_idx is not None:
+            stamp_items = self._stamp_shelf_items()
+            state.selected_stamp = stamp_items[state.stamp_hover_idx]
+            state.reset_stroke()
+            state.cursor_thickness = STAMP_SIZE
+            return
 
         if pinch_distance(landmarks) < PINCH_THRESHOLD:
             if now - state.last_pinch_time > PINCH_COOLDOWN:
                 state.cycle_color()
+                state.palette_pop_until = now + 0.18
                 state.last_pinch_time = now
                 self.sound_engine.play("color_change")
                 state.reset_draw()
-            return
-
-        if is_open_palm(landmarks):
-            if state.open_palm_start is None:
-                state.open_palm_start = now
-            elif now - state.open_palm_start >= CLEAR_HOLD_TIME:
-                self._clear_canvas()
-                state.open_palm_start = None
-            state.reset_draw()
-            return
-        else:
-            state.open_palm_start = None
-
-        if is_fist(landmarks):
-            state.reset_draw()
             return
 
         if is_v_sign(landmarks):
@@ -1437,6 +1775,17 @@ class AirCanvas:
             smooth_pos = state.smooth(pos[0], pos[1])
             thickness = state.get_thickness()
             draw_color = self._current_draw_color(state)
+
+            if (
+                state.selected_stamp is not None
+                and smooth_pos[1] > STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT + 10
+            ):
+                self._place_stamp(state, smooth_pos, now)
+                state.cursor_pos = smooth_pos
+                state.cursor_thickness = STAMP_SIZE
+                state.prev_pos = None
+                state.drawing = False
+                return
 
             if not state.drawing:
                 self.sound_engine.play("draw_start")
@@ -1494,23 +1843,49 @@ class AirCanvas:
             state.cursor_pos = smooth_pos
             state.cursor_thickness = thickness
         else:
-            state.reset_draw()
+            state.reset_stroke()
 
     def _draw_cursors(self, display):
+        now = time.time()
         for state in (self.left_hand, self.right_hand):
             if state.cursor_pos is None:
                 continue
+            cursor_overlay = display.copy()
+            cv2.circle(
+                cursor_overlay,
+                state.cursor_pos,
+                state.cursor_thickness // 2 + 4,
+                state.color,
+                -1,
+            )
+            cv2.addWeighted(
+                display,
+                1.0 - CURSOR_FILL_ALPHA,
+                cursor_overlay,
+                CURSOR_FILL_ALPHA,
+                0,
+                display,
+            )
             cv2.circle(
                 display,
                 state.cursor_pos,
                 state.cursor_thickness // 2 + 4,
-                state.color,
+                (255, 255, 255),
                 2,
             )
+            if state.selected_stamp is not None:
+                self._draw_stamp_preview(
+                    display, state.cursor_pos, state.selected_stamp, state.color
+                )
+            self._draw_clear_progress(display, state)
             if AVATARS_ENABLED:
                 is_left = state is self.left_hand
                 avatar = AVATAR_LEFT if is_left else AVATAR_RIGHT
-                pos = (state.cursor_pos[0], state.cursor_pos[1] - 40)
+                bob = int(
+                    math.sin(now * AVATAR_BOB_SPEED + (0 if is_left else math.pi))
+                    * AVATAR_BOB_AMPLITUDE
+                )
+                pos = (state.cursor_pos[0], state.cursor_pos[1] - 70 + bob)
                 if avatar == "penguin":
                     draw_penguin(display, pos, AVATAR_SIZE // 2)
                 elif avatar == "cat":
@@ -1518,49 +1893,28 @@ class AirCanvas:
 
     def _draw_ui(self, display):
         h, w = display.shape[:2]
-
-        # Left hand color indicator
-        cv2.circle(display, (40, h - 40), 20, self.left_hand.color, -1)
-        cv2.putText(
-            display,
-            "L",
-            (30, h - 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Right hand color indicator
-        cv2.circle(display, (w - 40, h - 40), 20, self.right_hand.color, -1)
-        cv2.putText(
-            display,
-            "R",
-            (w - 50, h - 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # FPS
-        cv2.putText(
-            display,
-            f"FPS: {self.fps:.0f}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
-
-        if THEME_ENABLED:
-            theme_name = self.themes[self.theme_idx].upper()
+        now = time.time()
+        self._draw_stamp_shelf(display)
+        self._draw_palette(display, self.left_hand, now)
+        self._draw_palette(display, self.right_hand, now)
+        pulse = math.sin(now * 2.4)
+        self._draw_color_blob(display, (80, h - 85), self.left_hand.color, pulse)
+        self._draw_color_blob(display, (w - 80, h - 85), self.right_hand.color, -pulse)
+        self._draw_rainbow_arc(display)
+        self._draw_save_overlay(display, now)
+        if DEBUG:
             cv2.putText(
                 display,
-                f"THEME: {theme_name}",
+                f"FPS: {self.fps:.0f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                display,
+                f"THEME: {self.themes[self.theme_idx].upper()}",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -1568,41 +1922,6 @@ class AirCanvas:
                 1,
                 cv2.LINE_AA,
             )
-
-        if RAINBOW_ENABLED and self.rainbow_mode:
-            cv2.putText(
-                display,
-                "RAINBOW",
-                (w // 2 - 60, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                hue_to_bgr(self.rainbow_hue),
-                2,
-                cv2.LINE_AA,
-            )
-
-        if time.time() < self.export_overlay_until:
-            cv2.putText(
-                display,
-                "Saved!",
-                (w // 2 - 60, h // 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (0, 255, 0),
-                3,
-                cv2.LINE_AA,
-            )
-
-        cv2.putText(
-            display,
-            "Point=Draw | V=Stamp | a=Alive | h=Hunt | p=Print | r=Rain | b=Theme",
-            (10, h - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (180, 180, 180),
-            1,
-            cv2.LINE_AA,
-        )
 
     def run(self):
         if FULLSCREEN:
@@ -1664,15 +1983,23 @@ class AirCanvas:
                             state.reset_draw()
 
                 current_theme = self.themes[self.theme_idx]
-                if current_theme not in self.theme_bg_cache:
+                if (
+                    current_theme != "camera"
+                    and current_theme not in self.theme_bg_cache
+                ):
                     self.theme_bg_cache[current_theme] = generate_theme_background(
                         current_theme, self.frame_w, self.frame_h
                     )
                 visible_strokes = self._visible_stroke_layer(time.time())
                 stroke_mask = self._layer_mask(visible_strokes)
                 stamp_mask = self._layer_mask(self.stamp_layer)
+                background = (
+                    darken_frame(frame, CAMERA_BG_DARKEN_ALPHA)
+                    if current_theme == "camera"
+                    else self.theme_bg_cache[current_theme]
+                )
                 display = compose_art_layers(
-                    self.theme_bg_cache[current_theme],
+                    background,
                     visible_strokes,
                     stroke_mask,
                     self.stamp_layer,
@@ -1683,6 +2010,7 @@ class AirCanvas:
                 self._draw_shape_hunt_overlay(display)
                 self._draw_cursors(display)
                 self._draw_ui(display)
+                self._apply_save_flash(display, time.time())
                 cv2.imshow(WINDOW_NAME, display)
 
                 if self.snap_clear_event.is_set():
@@ -1695,9 +2023,7 @@ class AirCanvas:
                 elif key == CLEAR_KEY:
                     self._clear_canvas()
                 elif key == SAVE_KEY:
-                    filename = f"drawing_{int(time.time())}.png"
-                    cv2.imwrite(filename, self.canvas)
-                    print(f"💾 Saved: {filename}")
+                    self._save_art(include_frame=False)
                 elif key == EXPORT_KEY:
                     self._export_print()
                 elif key == DRAW_ALIVE_KEY and DRAW_ALIVE_ENABLED:
