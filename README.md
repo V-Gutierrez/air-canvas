@@ -1,35 +1,75 @@
-# 🎨 Air Canvas
+# Air Canvas 🎨
 
-Desenhe no ar com as mãos! Feito pro Dante (e pra qualquer criança).
+**Digital toy for kids — paint in the air with your hands.**
 
-## Como usar
+No screens to scroll. No likes to chase. No feeds to compare. Just pure creativity, drawn in the air.
 
-```bash
-chmod +x run.sh
-./run.sh
-```
+Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, close your fist to pause. Two hands, eight colors, infinite imagination.
 
-## Gestos
+Built for kids who deserve to create without consuming.
 
-| Gesto | Ação |
-|-------|------|
-| 👆 Dedo indicador | Desenhar |
-| ✊ Punho | Parar de desenhar |
-| 🤏 Pinça | Trocar cor |
-| 🖐️ Palma aberta (1.5s) | Limpar tela |
+## Demo
+
+> 👆 Point = Draw  
+> ✊ Fist = Stop  
+> 🤏 Pinch = Change color  
+> 🖐️ Palm (hold) = Clear canvas  
+> **s** = Save drawing | **c** = Clear | **q** = Quit
 
 ## Features
 
-- 🤚 Duas mãos simultâneas (cada uma com cor diferente)
-- 🌈 8 cores vibrantes (4 por mão, cicla com pinça)
-- ✨ Efeito neon/glow nos traços
-- 🖌️ Espessura varia com velocidade (lento = grosso, rápido = fino)
-- 💾 Salvar desenho: tecla `s`
-- 🧹 Limpar: tecla `c` ou palma aberta
-- ❌ Sair: tecla `q`
+- **Two-hand drawing** — left hand has 4 colors, right hand has 4 colors (8 total)
+- **Pressure simulation** — brush gets thicker when moving slowly, thinner when fast
+- **Neon glow effect** — drawings look magical on a dark background
+- **Fullscreen mode** — immersive experience for kids
+- **Save to PNG** — press `s` to keep their masterpiece
+- **Zero accounts, zero internet** — everything runs locally on your Mac
 
-## Requisitos
+## Requirements
 
-- Python 3.11+
+- macOS (tested on Apple Silicon)
+- Python 3.11+ (3.13 recommended)
 - Webcam
-- macOS / Linux / Windows
+
+## Quick Start
+
+```bash
+git clone https://github.com/V-Gutierrez/air-canvas.git
+cd air-canvas
+./run.sh
+```
+
+The script automatically:
+1. Creates a Python virtual environment
+2. Installs dependencies
+3. Downloads the hand tracking model (~10MB)
+4. Launches Air Canvas in fullscreen
+
+## Camera Setup
+
+By default, Air Canvas uses camera index `1` to skip iPhone Continuity Camera on MacBooks. If your webcam isn't detected, edit `config.py`:
+
+```python
+CAMERA_INDEX = 0  # Try 0 if camera doesn't open
+```
+
+## Configuration
+
+All settings live in `config.py` — colors, brush thickness, gesture thresholds, and more. Kid-friendly defaults out of the box.
+
+## How It Works
+
+- **MediaPipe Hand Landmarker** — tracks 21 hand landmarks per hand at 30fps
+- **OpenCV** — renders the canvas and camera feed
+- **Gesture recognition** — simple heuristics (finger extension, pinch distance, palm detection)
+- **Threaded camera** — camera reads run on a separate thread for smooth performance
+
+## Built With
+
+- [MediaPipe](https://developers.google.com/mediapipe) — hand tracking
+- [OpenCV](https://opencv.org/) — rendering
+- [NumPy](https://numpy.org/) — math
+
+## License
+
+MIT — do whatever you want with it. Make your kids happy. ✌️
