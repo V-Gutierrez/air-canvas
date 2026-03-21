@@ -4,17 +4,49 @@
 
 No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn in the air.
 
+<p align="center">
+  <img src="assets/demo.jpg" alt="Father and son painting in the air together" width="600">
+</p>
+
 Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, close your fist to pause. Two hands, eight colors, infinite imagination.
 
 Built for kids who deserve to create without consuming.
 
-## Demo
+## Why Air Canvas?
 
-> 👆 Point = Draw  
-> ✊ Fist = Stop  
-> 🤏 Pinch = Change color  
-> 🖐️ Palm (hold) = Clear canvas  
-> **s** = Save drawing | **c** = Clear | **q** = Quit
+### 🧠 Cognitive Development
+- **Hand-eye coordination** — kids learn to control precise finger movements while watching the screen respond in real time
+- **Spatial awareness** — understanding how their hand position maps to the canvas builds spatial reasoning
+- **Cause and effect** — every gesture has an immediate, visible result
+
+### 🎨 Creative Expression
+- **No rules, no templates** — just a blank canvas and colors
+- **Two-hand painting** — left hand and right hand have different color palettes, encouraging bilateral coordination
+- **Pressure simulation** — move slowly for thick lines, fast for thin — teaches control and intentionality
+
+### 🧘 Low-Stimulus Design
+- **No scores or achievements** — removes performance anxiety
+- **No social features** — no sharing, no likes, no comparison
+- **No ads, no in-app purchases** — runs 100% locally, no internet needed
+- **Dark canvas** — easy on the eyes, calming environment
+- **No time pressure** — kids paint at their own pace
+
+### 👨‍👩‍👧‍👦 Parent-Child Bonding
+- **Two-hand support** — parent and child can paint together on the same canvas
+- **Save & print** — press `s` to save their masterpiece as PNG
+- **Screen time with purpose** — active creation instead of passive consumption
+
+## Controls
+
+| Gesture | Action |
+|---------|--------|
+| 👆 Point | Draw |
+| ✊ Fist | Stop drawing |
+| 🤏 Pinch | Change color |
+| 🖐️ Palm (hold) | Clear canvas |
+| **s** | Save drawing |
+| **c** | Clear canvas |
+| **q** | Quit |
 
 ## Features
 
@@ -22,8 +54,8 @@ Built for kids who deserve to create without consuming.
 - **Pressure simulation** — brush gets thicker when moving slowly, thinner when fast
 - **Neon glow effect** — drawings look magical on a dark background
 - **Fullscreen mode** — immersive experience for kids
-- **Save to PNG** — press `s` to keep their masterpiece
-- **Zero accounts, zero internet** — everything runs locally on your Mac
+- **Save to PNG** — keep their masterpieces
+- **Zero accounts, zero internet** — everything runs locally
 
 ## Requirements
 
