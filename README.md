@@ -8,7 +8,7 @@ No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn 
   <img src="assets/demo.jpg" alt="Father and son painting in the air together" width="600">
 </p>
 
-Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, close your fist to pause. Two hands, eight colors, infinite imagination.
+Air Canvas turns your webcam into a finger-painting canvas. Point your finger to draw, pinch to change colors, flash a V-sign to stamp playful shapes, and toggle rainbow mode for extra color. Two hands, eight colors, infinite imagination.
 
 Built for kids who deserve to create without consuming.
 
@@ -41,9 +41,11 @@ Built for kids who deserve to create without consuming.
 | Gesture | Action |
 |---------|--------|
 | 👆 Point | Draw |
+| ✌️ V-sign | Place sticker |
 | ✊ Fist | Stop drawing |
 | 🤏 Pinch | Change color |
 | 🖐️ Palm (hold) | Clear canvas |
+| **r** | Toggle rainbow mode |
 | **s** | Save drawing |
 | **c** | Clear canvas |
 | **q** | Quit |
@@ -51,6 +53,10 @@ Built for kids who deserve to create without consuming.
 ## Features
 
 - **Two-hand drawing** — left hand has 4 colors, right hand has 4 colors (8 total)
+- **Gesture stickers** — flash a V-sign to stamp stars, hearts, circles, and smileys
+- **Rainbow mode** — press `r` to shift brush colors through the full spectrum while drawing
+- **Sparkle particles** — a light particle trail follows the fingertip without overwhelming the screen
+- **Fun sounds** — playful synthesized tones react to drawing, color changes, clears, and stamps
 - **Pressure simulation** — brush gets thicker when moving slowly, thinner when fast
 - **Neon glow effect** — drawings look magical on a dark background
 - **Fullscreen mode** — immersive experience for kids
