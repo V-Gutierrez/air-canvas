@@ -5,7 +5,7 @@
 No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn in the air.
 
 <p align="center">
-  <img src="assets/demo.jpg" alt="Father and son painting in the air together" width="600">
+  <img src="assets/demo.jpg" alt="Father and Spider-Son painting in the air together" width="600">
 </p>
 
 <p align="center">
