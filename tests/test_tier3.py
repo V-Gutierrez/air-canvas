@@ -57,7 +57,6 @@ class ShapeHuntTests(unittest.TestCase):
         canvas.frame_w = 320
         canvas.frame_h = 240
         canvas.canvas = np.zeros((240, 320, 3), dtype=np.uint8)
-        canvas.stamp_layer = np.zeros((240, 320, 3), dtype=np.uint8)
         canvas.shape_hunt_shape_idx = 0
         canvas.shape_hunt_size = config.SHAPE_HUNT_START_SIZE
 
@@ -77,7 +76,6 @@ class ShapeHuntTests(unittest.TestCase):
         canvas.frame_w = 160
         canvas.frame_h = 120
         canvas.canvas = np.zeros((120, 160, 3), dtype=np.uint8)
-        canvas.stamp_layer = np.zeros((120, 160, 3), dtype=np.uint8)
         canvas.shape_hunt_active = True
         canvas.shape_hunt_shape_idx = 0
         canvas.shape_hunt_shape_name = "circle"
@@ -86,7 +84,6 @@ class ShapeHuntTests(unittest.TestCase):
         canvas.shape_hunt_snapshot = np.zeros((120, 160, 3), dtype=np.uint8)
         canvas.shape_hunt_target_mask = np.full((120, 160), 255, dtype=np.uint8)
         canvas.particle_system = mock.Mock()
-        canvas.sound_engine = mock.Mock()
 
         canvas.canvas[:] = 255
 
@@ -95,7 +92,6 @@ class ShapeHuntTests(unittest.TestCase):
 
         self.assertGreaterEqual(coverage, config.SHAPE_HUNT_SUCCESS_COVERAGE)
         canvas.particle_system.emit.assert_called_once()
-        canvas.sound_engine.play.assert_called_once_with("stamp")
         self.assertEqual(canvas.shape_hunt_shape_idx, 1)
         self.assertLess(canvas.shape_hunt_size, config.SHAPE_HUNT_START_SIZE)
         restart.assert_called_once()
@@ -124,8 +120,6 @@ class PrintExportTests(unittest.TestCase):
         canvas.frame_w = 20
         canvas.frame_h = 10
         canvas.canvas = np.full((10, 20, 3), 150, dtype=np.uint8)
-        canvas.stamp_layer = np.zeros((10, 20, 3), dtype=np.uint8)
-        canvas.sound_engine = mock.Mock()
         canvas.save_overlay_until = 0.0
         canvas.save_flash_until = 0.0
         canvas.save_overlay_path = ""
@@ -155,46 +149,36 @@ class PrintExportTests(unittest.TestCase):
             self.assertTrue(
                 canvas.save_overlay_path.endswith("art-2026-03-21-140506.png")
             )
-            canvas.sound_engine.play.assert_called_once_with("save")
 
 
 class LayerCompositionTests(unittest.TestCase):
-    def test_compose_art_layers_preserves_separate_stroke_and_stamp_pixels(self):
+    def test_compose_art_layers_applies_strokes_on_background(self):
         background = np.zeros((6, 6, 3), dtype=np.uint8)
         stroke_layer = np.zeros_like(background)
         stroke_mask = np.zeros((6, 6), dtype=np.uint8)
-        stamp_layer = np.zeros_like(background)
-        stamp_mask = np.zeros((6, 6), dtype=np.uint8)
 
         stroke_layer[1, 1] = (10, 20, 30)
         stroke_mask[1, 1] = 255
-        stamp_layer[4, 4] = (100, 110, 120)
-        stamp_mask[4, 4] = 255
 
         composite = air_canvas.compose_art_layers(
             background,
             stroke_layer,
             stroke_mask,
-            stamp_layer,
-            stamp_mask,
         )
 
         self.assertEqual(tuple(composite[1, 1]), (10, 20, 30))
-        self.assertEqual(tuple(composite[4, 4]), (100, 110, 120))
+        self.assertEqual(tuple(composite[0, 0]), (0, 0, 0))
 
-    def test_compose_current_art_includes_strokes_and_stamps(self):
+    def test_compose_current_art_includes_strokes(self):
         canvas = air_canvas.AirCanvas.__new__(air_canvas.AirCanvas)
         canvas.frame_w = 6
         canvas.frame_h = 6
         canvas.stroke_layer = np.zeros((6, 6, 3), dtype=np.uint8)
-        canvas.stamp_layer = np.zeros((6, 6, 3), dtype=np.uint8)
         canvas.stroke_layer[1, 1] = (10, 20, 30)
-        canvas.stamp_layer[4, 4] = (100, 110, 120)
 
         art = canvas._compose_current_art()
 
         self.assertEqual(tuple(art[1, 1]), (10, 20, 30))
-        self.assertEqual(tuple(art[4, 4]), (100, 110, 120))
 
 
 if __name__ == "__main__":

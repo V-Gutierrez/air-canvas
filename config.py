@@ -52,15 +52,6 @@ THUMB_EXTENSION_THRESHOLD = 0.04
 # Smoothing
 DRAW_SMOOTHING = 0.5  # EMA alpha for brush position
 
-# Fun
-DRAW_SOUND = True
-SOUND_VOLUME = 0.25
-SOUND_DURATION = 0.12
-
-STICKERS_ENABLED = True
-STAMP_SIZE = 24
-STAMP_COOLDOWN = 0.8
-
 RAINBOW_ENABLED = True
 RAINBOW_KEY = ord("r")
 RAINBOW_HUE_STEP = 3
@@ -106,29 +97,9 @@ PALETTE_DWELL_TIME = 0.3
 PALETTE_CIRCLE_RADIUS = 25
 PALETTE_EDGE_MARGIN = 18
 PALETTE_VERTICAL_GAP = 18
-STAMP_SHELF_HEIGHT = 84
-STAMP_SHELF_TOP_MARGIN = 18
-STAMP_ICON_SIZE = 28
-STAMP_ICON_GAP = 26
-STAMP_PREVIEW_ALPHA = 0.45
 HAND_COLOR_BLOB_RADIUS = 60
 CURSOR_FILL_ALPHA = 0.35
 RAINBOW_ARC_THICKNESS = 18
-
-# Drawing music — pentatonic scale by color, octave by hand side
-MUSIC_MODE = True
-MUSIC_DRAW_COOLDOWN = 0.35  # Seconds between notes while drawing (per hand)
-MUSIC_MAX_CONCURRENT = 2  # Max simultaneous audio subprocesses
-
-PENTATONIC_NOTES_LOW = [261, 294, 330, 392, 440]
-PENTATONIC_NOTES_HIGH = [523, 587, 659, 784, 880]
-
-# Snap-to-clear via microphone spike
-SNAP_CLEAR_ENABLED = False  # Opt-in; gracefully disabled if sounddevice missing
-SNAP_CLEAR_THRESHOLD = 0.6  # Amplitude threshold (0–1) to trigger clear
-SNAP_CLEAR_COOLDOWN = 2.0  # Seconds between mic-triggered clears
-SNAP_CLEAR_CHUNK = 1024  # Audio frames per mic read
-SNAP_CLEAR_SAMPLE_RATE = 44100  # Mic sample rate
 
 PARTICLES_ENABLED = True
 PARTICLE_MAX_COUNT = 100

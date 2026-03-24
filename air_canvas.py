@@ -5,20 +5,14 @@ import numpy as np
 import math
 import time
 import os
-import io
-import wave
-import shutil
-import tempfile
-import subprocess
 import random
 import threading
 import urllib.request
 import importlib
 import importlib.util
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple, List, Protocol, Any
+from typing import Optional, Tuple, List, Protocol
 
 _cv2_spec = importlib.util.find_spec("cv2")
 if _cv2_spec is not None:
@@ -156,6 +150,12 @@ else:
             return _CV2Fallback.rectangle(
                 image, (x, y - height), (x + width, y), color, thickness
             )
+
+        @staticmethod
+        def getTextSize(text, _font, scale, _thickness):
+            height = max(6, int(12 * scale))
+            width = max(1, int(len(text) * 7 * scale))
+            return (width, height), height
 
         @staticmethod
         def rectangle(image, pt1, pt2, color, thickness):
@@ -365,27 +365,20 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 
 # Landmark indices
+WRIST = 0
 INDEX_TIP = 8
 INDEX_PIP = 6
 THUMB_TIP = 4
 THUMB_IP = 3
 MIDDLE_TIP = 12
+MIDDLE_MCP = 9
 MIDDLE_PIP = 10
 RING_TIP = 16
 RING_PIP = 14
 PINKY_TIP = 20
 PINKY_PIP = 18
 
-SOUND_SAMPLE_RATE = 22050
-STAMP_SEQUENCE = ("star", "heart", "circle", "smiley")
 SHAPE_HUNT_SEQUENCE = ("circle", "triangle", "square", "star")
-SOUND_EVENT_FREQUENCIES = {
-    "draw_start": 392,
-    "color_change": 523,
-    "clear": 262,
-    "stamp": 659,
-    "save": 784,
-}
 
 
 def download_model():
@@ -467,14 +460,20 @@ def is_thumb_extended(landmarks, handedness: str) -> bool:
     return thumb_delta > THUMB_EXTENSION_THRESHOLD
 
 
+def is_palm_facing_camera(landmarks) -> bool:
+    """Palm faces camera when middle MCP is closer (smaller z) than wrist."""
+    return landmarks[MIDDLE_MCP].z < landmarks[WRIST].z
+
+
 def is_open_palm(landmarks, handedness: str) -> bool:
-    """All 5 fingers extended."""
+    """All 5 fingers extended and palm facing the camera."""
     return (
         is_thumb_extended(landmarks, handedness)
         and is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
         and is_finger_extended(landmarks, MIDDLE_TIP, MIDDLE_PIP)
         and is_finger_extended(landmarks, RING_TIP, RING_PIP)
         and is_finger_extended(landmarks, PINKY_TIP, PINKY_PIP)
+        and is_palm_facing_camera(landmarks)
     )
 
 
@@ -494,215 +493,25 @@ def pinch_distance(landmarks) -> float:
     return math.hypot(dx, dy)
 
 
+def is_intentional_pinch(landmarks) -> bool:
+    return (
+        pinch_distance(landmarks) < PINCH_THRESHOLD
+        and not is_finger_extended(landmarks, MIDDLE_TIP, MIDDLE_PIP)
+        and not is_finger_extended(landmarks, RING_TIP, RING_PIP)
+        and not is_finger_extended(landmarks, PINKY_TIP, PINKY_PIP)
+    )
+
+
 def fingertip_pos(landmarks, frame_w, frame_h) -> Tuple[int, int]:
     x = int(landmarks[INDEX_TIP].x * frame_w)
     y = int(landmarks[INDEX_TIP].y * frame_h)
     return x, y
 
 
-def v_sign_center(landmarks, frame_w, frame_h) -> Tuple[int, int]:
-    x = int(((landmarks[INDEX_TIP].x + landmarks[MIDDLE_TIP].x) / 2) * frame_w)
-    y = int(((landmarks[INDEX_TIP].y + landmarks[MIDDLE_TIP].y) / 2) * frame_h)
-    return x, y
-
-
-def is_v_sign(landmarks) -> bool:
-    return (
-        is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
-        and is_finger_extended(landmarks, MIDDLE_TIP, MIDDLE_PIP)
-        and not is_finger_extended(landmarks, RING_TIP, RING_PIP)
-        and not is_finger_extended(landmarks, PINKY_TIP, PINKY_PIP)
-    )
-
-
 def hue_to_bgr(hue: int) -> Tuple[int, int, int]:
     hsv = np.array([[[int(hue) % 180, 255, 255]]], dtype=np.uint8)
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
     return int(bgr[0]), int(bgr[1]), int(bgr[2])
-
-
-def generate_tone(frequency: int, duration: float, volume: float) -> np.ndarray:
-    sample_count = max(1, int(SOUND_SAMPLE_RATE * duration))
-    t = np.arange(sample_count, dtype=np.float32) / SOUND_SAMPLE_RATE
-    tone = np.sin(2 * np.pi * frequency * t)
-    fade_count = min(sample_count // 2, max(1, int(SOUND_SAMPLE_RATE * 0.01)))
-    fade_in = np.linspace(0.0, 1.0, fade_count, dtype=np.float32)
-    fade_out = np.linspace(1.0, 0.0, fade_count, dtype=np.float32)
-    tone[:fade_count] *= fade_in
-    tone[-fade_count:] *= fade_out
-    return (tone * float(volume)).astype(np.float32)
-
-
-def tone_to_wav_bytes(samples: np.ndarray) -> bytes:
-    pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(SOUND_SAMPLE_RATE)
-        wav_file.writeframes(pcm.tobytes())
-    return buffer.getvalue()
-
-
-def resolve_sound_player() -> Optional[str]:
-    if shutil.which("afplay"):
-        return "afplay"
-    for command in ("aplay", "paplay"):
-        if shutil.which(command):
-            return command
-    return None
-
-
-class SoundEngine:
-    def __init__(self, enabled: bool, max_concurrent: int = MUSIC_MAX_CONCURRENT):
-        self.enabled = enabled
-        self.player = resolve_sound_player() if enabled else None
-        self.tones = {
-            name: tone_to_wav_bytes(generate_tone(freq, SOUND_DURATION, SOUND_VOLUME))
-            for name, freq in SOUND_EVENT_FREQUENCIES.items()
-        }
-        self._active_count = 0
-        self._count_lock = threading.Lock()
-        self._max_concurrent = max_concurrent
-
-    def play(self, event_name: str):
-        if not self.enabled or self.player is None:
-            return
-        tone = self.tones.get(event_name)
-        if tone is None:
-            return
-        self._launch(tone)
-
-    def play_tone(self, frequency: int):
-        if not self.enabled or self.player is None:
-            return
-        with self._count_lock:
-            if self._active_count >= self._max_concurrent:
-                return
-        wav = tone_to_wav_bytes(generate_tone(frequency, SOUND_DURATION, SOUND_VOLUME))
-        self._launch(wav)
-
-    def _launch(self, wav_bytes: bytes):
-        with self._count_lock:
-            if self._active_count >= self._max_concurrent:
-                return
-            self._active_count += 1
-        threading.Thread(
-            target=self._play_bytes, args=(wav_bytes,), daemon=True
-        ).start()
-
-    def _play_bytes(self, wav_bytes: bytes):
-        temp_path: Optional[str] = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-                temp_file.write(wav_bytes)
-                temp_path = temp_file.name
-            if self.player is None:
-                return
-            command: List[str] = [self.player]
-            if self.player in {"aplay", "paplay"}:
-                command.append("-q")
-            command.append(temp_path)
-            subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:
-            return
-        finally:
-            with self._count_lock:
-                self._active_count -= 1
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-
-
-_sounddevice_spec = importlib.util.find_spec("sounddevice")
-if _sounddevice_spec is not None:
-    _sounddevice = importlib.import_module("sounddevice")
-    _SOUNDDEVICE_AVAILABLE = True
-else:
-    _sounddevice = None
-    _SOUNDDEVICE_AVAILABLE = False
-
-
-def draw_star(canvas, center: Tuple[int, int], size: int, color: Tuple[int, int, int]):
-    outer = max(4, size)
-    inner = max(2, int(outer * 0.45))
-    points = []
-    for index in range(10):
-        angle = (math.pi / 5 * index) - (math.pi / 2)
-        radius = outer if index % 2 == 0 else inner
-        points.append(
-            [
-                int(center[0] + math.cos(angle) * radius),
-                int(center[1] + math.sin(angle) * radius),
-            ]
-        )
-    polygon = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.fillPoly(canvas, [polygon], color)
-
-
-def draw_heart(canvas, center: Tuple[int, int], size: int, color: Tuple[int, int, int]):
-    radius = max(4, size // 2)
-    cx, cy = center
-    cv2.circle(canvas, (cx - radius // 2, cy - radius // 3), radius // 2, color, -1)
-    cv2.circle(canvas, (cx + radius // 2, cy - radius // 3), radius // 2, color, -1)
-    triangle = np.array(
-        [
-            [cx - radius, cy - radius // 4],
-            [cx + radius, cy - radius // 4],
-            [cx, cy + radius],
-        ],
-        dtype=np.int32,
-    ).reshape((-1, 1, 2))
-    cv2.fillPoly(canvas, [triangle], color)
-
-
-def draw_smiley(
-    canvas, center: Tuple[int, int], size: int, color: Tuple[int, int, int]
-):
-    radius = max(6, size)
-    cx, cy = center
-    face_color = tuple(min(255, component + 40) for component in color)
-    cv2.circle(canvas, (cx, cy), radius, face_color, -1)
-    cv2.circle(canvas, (cx, cy), radius, color, 2)
-    eye_radius = max(1, radius // 6)
-    cv2.circle(canvas, (cx - radius // 3, cy - radius // 4), eye_radius, color, -1)
-    cv2.circle(canvas, (cx + radius // 3, cy - radius // 4), eye_radius, color, -1)
-    cv2.ellipse(
-        canvas,
-        (cx, cy + radius // 6),
-        (max(2, radius // 2), max(2, radius // 3)),
-        0,
-        0,
-        180,
-        color,
-        2,
-    )
-
-
-def draw_stamp(
-    canvas,
-    center: Tuple[int, int],
-    stamp_type: str,
-    size: int,
-    color: Tuple[int, int, int],
-):
-    if stamp_type == "star":
-        draw_star(canvas, center, size, color)
-        return
-    if stamp_type == "heart":
-        draw_heart(canvas, center, size, color)
-        return
-    if stamp_type == "circle":
-        cv2.circle(canvas, center, max(4, size), color, -1)
-        return
-    draw_smiley(canvas, center, size, color)
 
 
 def generate_theme_background(theme: str, width: int, height: int) -> np.ndarray:
@@ -771,14 +580,10 @@ def compose_art_layers(
     background: np.ndarray,
     stroke_layer: np.ndarray,
     stroke_mask: np.ndarray,
-    stamp_layer: np.ndarray,
-    stamp_mask: np.ndarray,
 ) -> np.ndarray:
     composite = background.copy()
     stroke_mask_3ch = cv2.merge([stroke_mask, stroke_mask, stroke_mask])
     composite = np.where(stroke_mask_3ch > 0, stroke_layer, composite)
-    stamp_mask_3ch = cv2.merge([stamp_mask, stamp_mask, stamp_mask])
-    composite = np.where(stamp_mask_3ch > 0, stamp_layer, composite)
     return composite
 
 
@@ -1053,19 +858,15 @@ class HandState:
         self.smooth_x: Optional[float] = None
         self.smooth_y: Optional[float] = None
         self.drawing = False
-        self.last_pinch_time = 0.0
+        self.pinch_active = False
         self.open_palm_start: Optional[float] = None
         self.prev_wrist_pos: Optional[Tuple[float, float]] = None
         self.speed = 0.0
         self.cursor_pos: Optional[Tuple[int, int]] = None
         self.cursor_thickness = BRUSH_MIN_THICKNESS
-        self.last_stamp_time = 0.0
-        self.stamp_idx = 0
         self.palette_hover_idx: Optional[int] = None
         self.palette_hover_start: Optional[float] = None
         self.palette_pop_until = 0.0
-        self.selected_stamp: Optional[str] = None
-        self.stamp_hover_idx: Optional[int] = None
         self.open_palm_progress = 0.0
         self.clear_indicator_pos: Optional[Tuple[int, int]] = None
 
@@ -1088,10 +889,6 @@ class HandState:
     def reset_palette_hover(self):
         self.palette_hover_idx = None
         self.palette_hover_start = None
-
-    def reset_stamp_selection(self):
-        self.selected_stamp = None
-        self.stamp_hover_idx = None
 
     def reset_stroke(self):
         self.prev_pos = None
@@ -1134,7 +931,6 @@ class HandState:
         self.reset_stroke()
         self.reset_open_palm()
         self.reset_palette_hover()
-        self.reset_stamp_selection()
 
 
 # ---------------------------------------------------------------------------
@@ -1164,11 +960,9 @@ class AirCanvas:
 
         self.frame_h, self.frame_w = frame.shape[:2]
         self.stroke_layer = np.zeros((self.frame_h, self.frame_w, 3), dtype=np.uint8)
-        self.stamp_layer = np.zeros((self.frame_h, self.frame_w, 3), dtype=np.uint8)
 
         self.left_hand = HandState(LEFT_HAND_COLORS)
         self.right_hand = HandState(RIGHT_HAND_COLORS)
-        self.sound_engine = SoundEngine(DRAW_SOUND)
         self.rainbow_mode = False
         self.rainbow_hue = 0
         self.particle_system = ParticleSystem(PARTICLE_MAX_COUNT)
@@ -1189,23 +983,12 @@ class AirCanvas:
         self.save_overlay_path = ""
         self.save_overlay_thumbnail: Optional[np.ndarray] = None
 
-        self._music_last_note_left = 0.0
-        self._music_last_note_right = 0.0
-
         default_idx = (
             THEMES.index(BACKGROUND_THEME) if BACKGROUND_THEME in THEMES else 0
         )
         self.theme_idx = default_idx
         self.themes = THEMES if THEME_ENABLED else ["dark"]
         self.theme_bg_cache: dict = {}
-
-        self.snap_clear_event = threading.Event()
-        self._snap_clear_last = 0.0
-        self._snap_clear_active = SNAP_CLEAR_ENABLED and _SOUNDDEVICE_AVAILABLE
-        if self._snap_clear_active:
-            threading.Thread(target=self._mic_listener, daemon=True).start()
-        elif SNAP_CLEAR_ENABLED and not _SOUNDDEVICE_AVAILABLE:
-            print("⚠️  snap-to-clear disabled: sounddevice not installed")
 
         # MediaPipe HandLandmarker
         if vision is None or mp_tasks is None:
@@ -1226,7 +1009,6 @@ class AirCanvas:
         print("  👆 Point (index finger) = Draw")
         print("  ✊ Fist = Stop drawing (lift brush)")
         print("  🤏 Pinch = Change color")
-        print("  ✌️ V-sign = Place sticker")
         print("  🖐️ Open palm (hold 1.5s) = Clear canvas")
         print(
             "  Press 'r' rainbow | 'a' draw alive | 'h' shape hunt | 's' save | 'p' print export | 'c' clear | 'q' quit"
@@ -1242,7 +1024,7 @@ class AirCanvas:
             len(state.colors) * (PALETTE_CIRCLE_RADIUS * 2)
             + (len(state.colors) - 1) * PALETTE_VERTICAL_GAP
         )
-        start_y = max(STAMP_SHELF_HEIGHT + 50, (self.frame_h - total_height) // 2)
+        start_y = max(50, (self.frame_h - total_height) // 2)
         spacing = PALETTE_CIRCLE_RADIUS * 2 + PALETTE_VERTICAL_GAP
         return [(x, start_y + index * spacing) for index in range(len(state.colors))]
 
@@ -1272,38 +1054,8 @@ class AirCanvas:
             state.palette_hover_start is not None
             and now - state.palette_hover_start >= PALETTE_DWELL_TIME
         ):
-            if state.color_idx != hover_idx:
-                state.set_color_idx(hover_idx, now)
-                self.sound_engine.play("color_change")
             state.palette_hover_start = now
         return True
-
-    def _stamp_shelf_items(self) -> List[str]:
-        return list(STAMP_SEQUENCE)
-
-    def _stamp_shelf_centers(self) -> List[Tuple[int, int]]:
-        items = self._stamp_shelf_items()
-        step = STAMP_ICON_SIZE * 2 + STAMP_ICON_GAP
-        total_width = (
-            len(items) * STAMP_ICON_SIZE * 2 + (len(items) - 1) * STAMP_ICON_GAP
-        )
-        start_x = max(50, (self.frame_w - total_width) // 2 + STAMP_ICON_SIZE)
-        y = STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT // 2
-        return [(start_x + idx * step, y) for idx in range(len(items))]
-
-    def _detect_stamp_hover(self, pos: Tuple[int, int]) -> Optional[int]:
-        for idx, center in enumerate(self._stamp_shelf_centers()):
-            if (
-                math.hypot(pos[0] - center[0], pos[1] - center[1])
-                <= STAMP_ICON_SIZE * 1.4
-            ):
-                return idx
-        return None
-
-    def _current_stamp_type(self, state: HandState) -> str:
-        if state.selected_stamp is not None:
-            return state.selected_stamp
-        return STAMP_SEQUENCE[state.stamp_idx % len(STAMP_SEQUENCE)]
 
     def _save_art(self, include_frame: bool = False):
         os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -1320,7 +1072,6 @@ class AirCanvas:
         self.save_flash_until = time.time() + SAVE_FLASH_DURATION
         self.save_overlay_path = display_path(filepath)
         self.save_overlay_thumbnail = build_save_thumbnail(art)
-        self.sound_engine.play("save")
         print(f"💾 Saved art: {filepath}")
         return filepath
 
@@ -1337,13 +1088,10 @@ class AirCanvas:
             (self.frame_h, self.frame_w, 3), CANVAS_BG_COLOR, dtype=np.uint8
         )
         stroke_mask = self._layer_mask(self.stroke_layer)
-        stamp_mask = self._layer_mask(self.stamp_layer)
         return compose_art_layers(
             background,
             self.stroke_layer,
             stroke_mask,
-            self.stamp_layer,
-            stamp_mask,
         )
 
     def _layer_mask(self, layer: np.ndarray) -> np.ndarray:
@@ -1393,7 +1141,6 @@ class AirCanvas:
                 (0, 220, 255),
                 PARTICLE_EMIT_COUNT * 4,
             )
-            self.sound_engine.play("stamp")
             self.shape_hunt_shape_idx = (self.shape_hunt_shape_idx + 1) % len(
                 SHAPE_HUNT_SEQUENCE
             )
@@ -1456,65 +1203,11 @@ class AirCanvas:
 
     def _clear_canvas(self):
         self.stroke_layer[:] = 0
-        self.stamp_layer[:] = 0
         self.shape_hunt_snapshot = None
         self.shape_hunt_target_mask[:] = 0
         self.particle_system.particles.clear()
         self.particle_overlay[:] = 0
-        self.sound_engine.play("clear")
         print("🧹 Canvas cleared!")
-
-    def _mic_listener(self):
-        import numpy as _np
-
-        rec = getattr(_sounddevice, "rec", None)
-        if rec is None:
-            return
-
-        while True:
-            try:
-                chunk = rec(
-                    SNAP_CLEAR_CHUNK,
-                    samplerate=SNAP_CLEAR_SAMPLE_RATE,
-                    channels=1,
-                    dtype="float32",
-                    blocking=True,
-                )
-                amplitude = float(_np.abs(chunk).max())
-                now = time.time()
-                if (
-                    amplitude >= SNAP_CLEAR_THRESHOLD
-                    and now - self._snap_clear_last >= SNAP_CLEAR_COOLDOWN
-                ):
-                    self._snap_clear_last = now
-                    self.snap_clear_event.set()
-            except Exception:
-                time.sleep(0.1)
-
-    def _place_stamp(self, state: HandState, center: Tuple[int, int], now: float):
-        if not STICKERS_ENABLED or now - state.last_stamp_time < STAMP_COOLDOWN:
-            state.cursor_pos = center
-            state.cursor_thickness = STAMP_SIZE
-            return
-        stamp_type = self._current_stamp_type(state)
-        draw_stamp(self.stamp_layer, center, stamp_type, STAMP_SIZE, state.color)
-        if state.selected_stamp is None:
-            state.stamp_idx = (state.stamp_idx + 1) % len(STAMP_SEQUENCE)
-        state.last_stamp_time = now
-        state.cursor_pos = center
-        state.cursor_thickness = STAMP_SIZE
-        self.sound_engine.play("stamp")
-
-    def _draw_stamp_preview(
-        self,
-        display: np.ndarray,
-        center: Tuple[int, int],
-        stamp_type: str,
-        color: Tuple[int, int, int],
-    ):
-        preview = np.zeros_like(display)
-        draw_stamp(preview, center, stamp_type, STAMP_SIZE, color)
-        cv2.addWeighted(display, 1.0, preview, STAMP_PREVIEW_ALPHA, 0, display)
 
     def _draw_clear_progress(self, display: np.ndarray, state: HandState):
         if state.clear_indicator_pos is None or state.open_palm_progress <= 0:
@@ -1568,35 +1261,6 @@ class AirCanvas:
                     (255, 255, 255),
                     4,
                 )
-
-    def _draw_stamp_shelf(self, display: np.ndarray):
-        shelf = np.zeros_like(display)
-        cv2.rectangle(
-            shelf,
-            (30, STAMP_SHELF_TOP_MARGIN),
-            (self.frame_w - 30, STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT),
-            (45, 45, 60),
-            -1,
-        )
-        cv2.addWeighted(display, 1.0, shelf, 0.55, 0, display)
-        for idx, (stamp_type, center) in enumerate(
-            zip(self._stamp_shelf_items(), self._stamp_shelf_centers())
-        ):
-            scale = (
-                1.25
-                if self.left_hand.stamp_hover_idx == idx
-                or self.right_hand.stamp_hover_idx == idx
-                else 1.0
-            )
-            selected = (
-                self.left_hand.selected_stamp == stamp_type
-                or self.right_hand.selected_stamp == stamp_type
-            )
-            icon_radius = int(STAMP_ICON_SIZE * scale)
-            cv2.circle(display, center, icon_radius + 10, (255, 255, 255), 2)
-            if selected:
-                cv2.circle(display, center, icon_radius + 15, (120, 240, 255), 4)
-            draw_stamp(display, center, stamp_type, icon_radius, (255, 230, 120))
 
     def _draw_rainbow_arc(self, display: np.ndarray):
         if not self.rainbow_mode:
@@ -1711,18 +1375,21 @@ class AirCanvas:
     def _process_hand(self, landmarks, handedness: str, frame):
         is_left = handedness == "Left"
         state = self.right_hand if is_left else self.left_hand
-        is_state_left = state is self.left_hand
 
         now = time.time()
         pos = fingertip_pos(landmarks, self.frame_w, self.frame_h)
+        palm_pos = (
+            int(landmarks[WRIST].x * self.frame_w),
+            int(landmarks[WRIST].y * self.frame_h),
+        )
         state.calc_speed(landmarks[INDEX_TIP].x, landmarks[INDEX_TIP].y)
         state.cursor_pos = pos
-        state.clear_indicator_pos = pos
+        state.clear_indicator_pos = palm_pos
 
         hovering_palette = self._update_palette_hover(state, pos, now)
-        state.stamp_hover_idx = self._detect_stamp_hover(pos)
 
         if is_open_palm(landmarks, handedness):
+            state.pinch_active = False
             if state.speed < CLEAR_STILLNESS:
                 if state.open_palm_start is None:
                     state.open_palm_start = now
@@ -1740,55 +1407,28 @@ class AirCanvas:
         state.reset_open_palm()
 
         if is_fist(landmarks):
+            state.pinch_active = False
             state.reset_stroke()
-            state.reset_stamp_selection()
             return
 
         if hovering_palette:
+            state.pinch_active = False
             state.reset_stroke()
             return
 
-        if state.stamp_hover_idx is not None:
-            stamp_items = self._stamp_shelf_items()
-            state.selected_stamp = stamp_items[state.stamp_hover_idx]
-            state.reset_stroke()
-            state.cursor_thickness = STAMP_SIZE
-            return
-
-        if pinch_distance(landmarks) < PINCH_THRESHOLD:
-            if now - state.last_pinch_time > PINCH_COOLDOWN:
+        if is_intentional_pinch(landmarks):
+            if not state.pinch_active:
+                state.pinch_active = True
                 state.cycle_color()
                 state.palette_pop_until = now + 0.18
-                state.last_pinch_time = now
-                self.sound_engine.play("color_change")
-                state.reset_draw()
+            state.reset_stroke()
             return
-
-        if is_v_sign(landmarks):
-            stamp_center = v_sign_center(landmarks, self.frame_w, self.frame_h)
-            self._place_stamp(state, stamp_center, now)
-            state.prev_pos = None
-            state.drawing = False
-            return
+        state.pinch_active = False
 
         if is_pointing(landmarks):
             smooth_pos = state.smooth(pos[0], pos[1])
             thickness = state.get_thickness()
             draw_color = self._current_draw_color(state)
-
-            if (
-                state.selected_stamp is not None
-                and smooth_pos[1] > STAMP_SHELF_TOP_MARGIN + STAMP_SHELF_HEIGHT + 10
-            ):
-                self._place_stamp(state, smooth_pos, now)
-                state.cursor_pos = smooth_pos
-                state.cursor_thickness = STAMP_SIZE
-                state.prev_pos = None
-                state.drawing = False
-                return
-
-            if not state.drawing:
-                self.sound_engine.play("draw_start")
 
             if state.prev_pos is not None:
                 cv2.line(
@@ -1822,21 +1462,6 @@ class AirCanvas:
                         draw_color,
                         PARTICLE_EMIT_COUNT,
                     )
-
-                if MUSIC_MODE:
-                    notes = (
-                        PENTATONIC_NOTES_LOW if is_state_left else PENTATONIC_NOTES_HIGH
-                    )
-                    freq = notes[state.color_idx % len(notes)]
-                    last_attr = (
-                        "_music_last_note_left"
-                        if is_state_left
-                        else "_music_last_note_right"
-                    )
-                    last_t = getattr(self, last_attr)
-                    if now - last_t >= MUSIC_DRAW_COOLDOWN:
-                        setattr(self, last_attr, now)
-                        self.sound_engine.play_tone(freq)
 
             state.prev_pos = smooth_pos
             state.drawing = True
@@ -1873,10 +1498,6 @@ class AirCanvas:
                 (255, 255, 255),
                 2,
             )
-            if state.selected_stamp is not None:
-                self._draw_stamp_preview(
-                    display, state.cursor_pos, state.selected_stamp, state.color
-                )
             self._draw_clear_progress(display, state)
             if AVATARS_ENABLED:
                 is_left = state is self.left_hand
@@ -1891,10 +1512,62 @@ class AirCanvas:
                 elif avatar == "cat":
                     draw_cat(display, pos, AVATAR_SIZE // 2)
 
+    def _draw_gesture_overlay(self, display: np.ndarray):
+        h, w = display.shape[:2]
+        lines = [
+            "POINT Draw | PINCH Color | PALM Clear 1.5s",
+            "FIST Pause | S Save",
+        ]
+        font_scale = 0.42
+        thickness = 1
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        if hasattr(cv2, "getTextSize"):
+            text_metrics = [
+                cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines
+            ]
+            text_w = max(metric[0] for metric in text_metrics)
+            text_h = max(metric[1] for metric in text_metrics)
+        else:
+            text_w = max(int(len(line) * 11 * font_scale) for line in lines)
+            text_h = int(22 * font_scale)
+
+        margin_x = 14
+        margin_y = 10
+        line_gap = 10
+        box_w = text_w + margin_x * 2
+        box_h = len(lines) * text_h + (len(lines) - 1) * line_gap + margin_y * 2
+
+        x = (w - box_w) // 2
+        y_box_bottom = h - 14
+        y_box_top = y_box_bottom - box_h
+
+        overlay = display.copy()
+        cv2.rectangle(
+            overlay,
+            (x, y_box_top),
+            (x + box_w, y_box_bottom),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.addWeighted(display, 1.0, overlay, 0.6, 0, display)
+
+        for index, line in enumerate(lines):
+            y_text = y_box_top + margin_y + text_h + index * (text_h + line_gap)
+            cv2.putText(
+                display,
+                line,
+                (x + margin_x, y_text),
+                font,
+                font_scale,
+                (200, 200, 200),
+                thickness,
+                cv2.LINE_AA,
+            )
+
     def _draw_ui(self, display):
         h, w = display.shape[:2]
         now = time.time()
-        self._draw_stamp_shelf(display)
         self._draw_palette(display, self.left_hand, now)
         self._draw_palette(display, self.right_hand, now)
         pulse = math.sin(now * 2.4)
@@ -1902,6 +1575,7 @@ class AirCanvas:
         self._draw_color_blob(display, (w - 80, h - 85), self.right_hand.color, -pulse)
         self._draw_rainbow_arc(display)
         self._draw_save_overlay(display, now)
+        self._draw_gesture_overlay(display)
         if DEBUG:
             cv2.putText(
                 display,
@@ -1992,7 +1666,6 @@ class AirCanvas:
                     )
                 visible_strokes = self._visible_stroke_layer(time.time())
                 stroke_mask = self._layer_mask(visible_strokes)
-                stamp_mask = self._layer_mask(self.stamp_layer)
                 background = (
                     darken_frame(frame, CAMERA_BG_DARKEN_ALPHA)
                     if current_theme == "camera"
@@ -2002,8 +1675,6 @@ class AirCanvas:
                     background,
                     visible_strokes,
                     stroke_mask,
-                    self.stamp_layer,
-                    stamp_mask,
                 )
 
                 self._draw_particles(display)
@@ -2012,10 +1683,6 @@ class AirCanvas:
                 self._draw_ui(display)
                 self._apply_save_flash(display, time.time())
                 cv2.imshow(WINDOW_NAME, display)
-
-                if self.snap_clear_event.is_set():
-                    self.snap_clear_event.clear()
-                    self._clear_canvas()
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == QUIT_KEY:

@@ -12,7 +12,7 @@ No scores. No feeds. No rewards. No dopamine loops. Just pure creativity, drawn 
   <img src="assets/demo-usage.jpg" alt="Air Canvas in action — drawing on screen" width="600">
 </p>
 
-Air Canvas turns your webcam into a finger-painting canvas. **You see yourself on screen** — point your finger to draw colorful lines on top of your own image. Pick colors from the on-screen palette, grab stickers from the stamp shelf, and watch your art come alive.
+Air Canvas turns your webcam into a finger-painting canvas. **You see yourself on screen** — point your finger to draw colorful lines on top of your own image, pinch to change colors, and use an always-visible gesture overlay to keep the experience simple and playful.
 
 Two hands, eight colors, infinite imagination. Built for kids who deserve to create without consuming.
 
@@ -42,19 +42,19 @@ Two hands, eight colors, infinite imagination. Built for kids who deserve to cre
 
 ## Controls
 
-Kids only need **2 gestures** — everything else is visual:
+Kids only need a few simple gestures:
 
 | Gesture | Action |
 |---------|--------|
-| 👆 Point | Draw / select from palette or shelf |
-| ✊ Fist | Stop drawing / deselect stamp |
+| 👆 Point | Draw |
+| 🤏 Pinch | Change color |
+| ✊ Fist | Stop drawing |
 | 🖐️ Palm (hold 1.5s) | Clear canvas (visual countdown) |
 
-**On-screen controls (no gestures needed):**
-| Element | How |
-|---------|-----|
-| 🎨 Color palette (left/right edges) | Point at a color, hold 0.3s to select |
-| ⭐ Stamp shelf (top) | Point at a stamp, then point on canvas to place |
+**On-screen help:**
+
+- A persistent bottom overlay shows the available gestures and the `S` save shortcut
+- Left and right color blobs show the current color for each hand
 
 **Keyboard shortcuts:**
 | Key | Action |
@@ -68,14 +68,14 @@ Kids only need **2 gestures** — everything else is visual:
 ## Features
 
 - **AR camera background** — see yourself behind your art (default), or switch to themed backgrounds
-- **Visual color palette** — always-visible palettes on screen edges, point to select (no hidden gestures)
-- **Stamp shelf** — pick stickers from the top bar, preview follows your finger, tap to place
+- **Pinch-based color changes** — colors stay fixed until you intentionally pinch
+- **Always-visible gesture overlay** — on-screen command bar keeps the controls easy to remember
 - **Two-hand drawing** — left hand has 4 colors, right hand has 4 colors (8 total)
 - **Rainbow mode** — press `r` to shift brush colors through the full spectrum
-- **Save with feedback** — saves to `~/Desktop/air-canvas-art/` with visual flash, path overlay, and sound
-- **Open palm clear** — hold palm still for 1.5s with visual countdown (accidental-clear-proof)
+- **Save with feedback** — saves to `~/Desktop/air-canvas-art/` with visual flash and path overlay
+- **Open palm clear** — requires a full palm facing the camera for 1.5s, with a visual countdown
 - **Sparkle particles** — light particle trail follows the fingertip
-- **Fun sounds** — playful tones react to drawing, color changes, clears, and stamps
+- **Silent experience** — no background music or reactive sounds
 - **Pressure simulation** — brush gets thicker when slow, thinner when fast
 - **Neon glow effect** — drawings look magical
 - **Kid-friendly UI** — no FPS counters, no keyboard hints, no tech jargon on screen
