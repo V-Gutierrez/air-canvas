@@ -6,8 +6,13 @@ import math
 import time
 import os
 import random
+import struct
+import subprocess
+import sys
+import tempfile
 import threading
 import urllib.request
+import wave
 import importlib
 import importlib.util
 from dataclasses import dataclass
@@ -366,6 +371,7 @@ MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/han
 
 # Landmark indices
 WRIST = 0
+INDEX_MCP = 5
 INDEX_TIP = 8
 INDEX_PIP = 6
 THUMB_TIP = 4
@@ -373,8 +379,10 @@ THUMB_IP = 3
 MIDDLE_TIP = 12
 MIDDLE_MCP = 9
 MIDDLE_PIP = 10
+RING_MCP = 13
 RING_TIP = 16
 RING_PIP = 14
+PINKY_MCP = 17
 PINKY_TIP = 20
 PINKY_PIP = 18
 
@@ -438,9 +446,45 @@ class CameraThread:
 # ---------------------------------------------------------------------------
 
 
+def landmark_distance(landmarks, start_idx: int, end_idx: int) -> float:
+    dx = landmarks[start_idx].x - landmarks[end_idx].x
+    dy = landmarks[start_idx].y - landmarks[end_idx].y
+    return math.hypot(dx, dy)
+
+
+def palm_size(landmarks) -> float:
+    return max(
+        landmark_distance(landmarks, WRIST, INDEX_MCP),
+        landmark_distance(landmarks, WRIST, MIDDLE_MCP),
+        landmark_distance(landmarks, WRIST, PINKY_MCP),
+    )
+
+
 def is_finger_extended(landmarks, tip_idx, pip_idx) -> bool:
-    """A finger is extended if TIP is above PIP (lower y = higher on screen)."""
-    return landmarks[tip_idx].y < landmarks[pip_idx].y
+    mcp_idx = {
+        INDEX_TIP: INDEX_MCP,
+        MIDDLE_TIP: MIDDLE_MCP,
+        RING_TIP: RING_MCP,
+        PINKY_TIP: PINKY_MCP,
+    }.get(tip_idx)
+    if mcp_idx is None:
+        return landmarks[tip_idx].y < landmarks[pip_idx].y
+    axis_x = landmarks[pip_idx].x - landmarks[mcp_idx].x
+    axis_y = landmarks[pip_idx].y - landmarks[mcp_idx].y
+    axis_length = math.hypot(axis_x, axis_y)
+    if axis_length < 1e-6:
+        return False
+    axis_x /= axis_length
+    axis_y /= axis_length
+    pip_projection = (landmarks[pip_idx].x - landmarks[mcp_idx].x) * axis_x + (
+        landmarks[pip_idx].y - landmarks[mcp_idx].y
+    ) * axis_y
+    tip_projection = (landmarks[tip_idx].x - landmarks[mcp_idx].x) * axis_x + (
+        landmarks[tip_idx].y - landmarks[mcp_idx].y
+    ) * axis_y
+    tip_distance = landmark_distance(landmarks, tip_idx, mcp_idx)
+    pip_distance = landmark_distance(landmarks, pip_idx, mcp_idx)
+    return tip_projection > pip_projection + 0.01 and tip_distance > pip_distance * 1.45
 
 
 def is_fist(landmarks) -> bool:
@@ -461,12 +505,10 @@ def is_thumb_extended(landmarks, handedness: str) -> bool:
 
 
 def is_palm_facing_camera(landmarks) -> bool:
-    """Palm faces camera when middle MCP is closer (smaller z) than wrist."""
     return landmarks[MIDDLE_MCP].z < landmarks[WRIST].z
 
 
 def is_open_palm(landmarks, handedness: str) -> bool:
-    """All 5 fingers extended and palm facing the camera."""
     return (
         is_thumb_extended(landmarks, handedness)
         and is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
@@ -478,7 +520,6 @@ def is_open_palm(landmarks, handedness: str) -> bool:
 
 
 def is_pointing(landmarks) -> bool:
-    """Only index finger extended — drawing mode."""
     return (
         is_finger_extended(landmarks, INDEX_TIP, INDEX_PIP)
         and not is_finger_extended(landmarks, MIDDLE_TIP, MIDDLE_PIP)
@@ -851,8 +892,17 @@ class ParticleSystem:
 
 
 class HandState:
-    def __init__(self, colors: List[Tuple[int, int, int]]):
+    def __init__(
+        self,
+        colors: List[Tuple[int, int, int]],
+        color_names: Optional[List[str]] = None,
+        tone_frequencies: Optional[List[int]] = None,
+    ):
         self.colors = colors
+        self.color_names = color_names or [
+            f"Color {index + 1}" for index in range(len(colors))
+        ]
+        self.tone_frequencies = tone_frequencies or list(COLOR_TONE_FREQUENCIES)
         self.color_idx = 0
         self.prev_pos: Optional[Tuple[int, int]] = None
         self.smooth_x: Optional[float] = None
@@ -873,6 +923,14 @@ class HandState:
     @property
     def color(self) -> Tuple[int, int, int]:
         return self.colors[self.color_idx]
+
+    @property
+    def color_name(self) -> str:
+        return self.color_names[self.color_idx % len(self.color_names)]
+
+    @property
+    def tone_frequency(self) -> int:
+        return self.tone_frequencies[self.color_idx % len(self.tone_frequencies)]
 
     def cycle_color(self):
         self.color_idx = (self.color_idx + 1) % len(self.colors)
@@ -961,8 +1019,17 @@ class AirCanvas:
         self.frame_h, self.frame_w = frame.shape[:2]
         self.stroke_layer = np.zeros((self.frame_h, self.frame_w, 3), dtype=np.uint8)
 
-        self.left_hand = HandState(LEFT_HAND_COLORS)
-        self.right_hand = HandState(RIGHT_HAND_COLORS)
+        self.audio = AudioManager()
+        self.left_hand = HandState(
+            LEFT_HAND_COLORS,
+            LEFT_HAND_COLOR_NAMES,
+            COLOR_TONE_FREQUENCIES,
+        )
+        self.right_hand = HandState(
+            RIGHT_HAND_COLORS,
+            RIGHT_HAND_COLOR_NAMES,
+            list(reversed(COLOR_TONE_FREQUENCIES)),
+        )
         self.rainbow_mode = False
         self.rainbow_hue = 0
         self.particle_system = ParticleSystem(PARTICLE_MAX_COUNT)
@@ -989,6 +1056,7 @@ class AirCanvas:
         self.theme_idx = default_idx
         self.themes = THEMES if THEME_ENABLED else ["dark"]
         self.theme_bg_cache: dict = {}
+        self.audio.start_music()
 
         # MediaPipe HandLandmarker
         if vision is None or mp_tasks is None:
@@ -1054,8 +1122,24 @@ class AirCanvas:
             state.palette_hover_start is not None
             and now - state.palette_hover_start >= PALETTE_DWELL_TIME
         ):
+            self._set_state_color(state, hover_idx, now)
             state.palette_hover_start = now
         return True
+
+    def _set_state_color(self, state: HandState, idx: int, now: float) -> bool:
+        next_idx = idx % len(state.colors)
+        changed = next_idx != state.color_idx
+        state.set_color_idx(next_idx, now)
+        if changed:
+            self._announce_color_change(state)
+        return changed
+
+    def _announce_color_change(self, state: HandState):
+        audio = getattr(self, "audio", None)
+        if audio is None:
+            return
+        audio.speak(state.color_name)
+        audio.play_tone(state.tone_frequency)
 
     def _save_art(self, include_frame: bool = False):
         os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -1231,11 +1315,48 @@ class AirCanvas:
         center: Tuple[int, int],
         color: Tuple[int, int, int],
         pulse: float,
+        label: str,
     ):
-        outer = max(10, int(HAND_COLOR_BLOB_RADIUS + pulse * 5))
+        outer = max(14, int(HAND_COLOR_BLOB_RADIUS + pulse * 6))
+        overlay = display.copy()
+        cv2.circle(
+            overlay, center, outer + 10, tuple(min(255, c + 55) for c in color), -1
+        )
+        cv2.addWeighted(display, 0.82, overlay, 0.18, 0, display)
         cv2.circle(display, center, outer, tuple(min(255, c + 35) for c in color), -1)
-        cv2.circle(display, center, max(8, outer - 16), color, -1)
-        cv2.circle(display, center, outer, (255, 255, 255), 3)
+        cv2.circle(display, center, max(12, outer - 18), color, -1)
+        cv2.circle(display, center, outer + 2, (255, 255, 255), 4)
+        cv2.putText(
+            display,
+            label,
+            (center[0] - outer, center[1] + outer + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            HAND_COLOR_LABEL_SCALE,
+            (245, 245, 245),
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _draw_palette_glow(
+        self,
+        display: np.ndarray,
+        center: Tuple[int, int],
+        color: Tuple[int, int, int],
+        radius: int,
+    ):
+        for extra_radius, alpha in (
+            (PALETTE_GLOW_RADIUS, 0.26),
+            (PALETTE_GLOW_RADIUS // 2, 0.18),
+        ):
+            overlay = display.copy()
+            cv2.circle(
+                overlay,
+                center,
+                radius + extra_radius,
+                tuple(min(255, channel + 40) for channel in color),
+                PALETTE_GLOW_THICKNESS,
+            )
+            cv2.addWeighted(display, 1.0 - alpha, overlay, alpha, 0, display)
 
     def _draw_palette(self, display: np.ndarray, state: HandState, now: float):
         for idx, center in enumerate(self._palette_positions(state)):
@@ -1245,10 +1366,12 @@ class AirCanvas:
                 radius = int(radius * 1.18)
             if state.color_idx == idx and state.palette_pop_until > now:
                 radius = int(radius * 1.35)
-            cv2.circle(display, center, radius + 8, (255, 255, 255), 2)
+            if state.color_idx == idx:
+                self._draw_palette_glow(display, center, color, radius + 8)
+            cv2.circle(display, center, radius + 10, (255, 255, 255), 3)
             cv2.circle(display, center, radius, color, -1)
             if state.color_idx == idx:
-                cv2.circle(display, center, radius + 13, (120, 240, 255), 4)
+                cv2.circle(display, center, radius + 15, (120, 240, 255), 4)
             if state.palette_hover_idx == idx and state.palette_hover_start is not None:
                 dwell = min(1.0, (now - state.palette_hover_start) / PALETTE_DWELL_TIME)
                 cv2.ellipse(
@@ -1261,6 +1384,27 @@ class AirCanvas:
                     (255, 255, 255),
                     4,
                 )
+            text_size = cv2.getTextSize(
+                state.color_names[idx],
+                cv2.FONT_HERSHEY_SIMPLEX,
+                PALETTE_LABEL_SCALE,
+                1,
+            )[0]
+            text_x = (
+                center[0] + radius + 14
+                if state is self.left_hand
+                else center[0] - radius - 14 - text_size[0]
+            )
+            cv2.putText(
+                display,
+                state.color_names[idx],
+                (text_x, center[1] + 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                PALETTE_LABEL_SCALE,
+                (245, 245, 245),
+                1,
+                cv2.LINE_AA,
+            )
 
     def _draw_rainbow_arc(self, display: np.ndarray):
         if not self.rainbow_mode:
@@ -1376,6 +1520,11 @@ class AirCanvas:
         is_left = handedness == "Left"
         state = self.right_hand if is_left else self.left_hand
 
+        if palm_size(landmarks) < MIN_PALM_SIZE:
+            state.pinch_active = False
+            state.reset_draw()
+            return
+
         now = time.time()
         pos = fingertip_pos(landmarks, self.frame_w, self.frame_h)
         palm_pos = (
@@ -1419,8 +1568,7 @@ class AirCanvas:
         if is_intentional_pinch(landmarks):
             if not state.pinch_active:
                 state.pinch_active = True
-                state.cycle_color()
-                state.palette_pop_until = now + 0.18
+                self._set_state_color(state, state.color_idx + 1, now)
             state.reset_stroke()
             return
         state.pinch_active = False
@@ -1476,10 +1624,11 @@ class AirCanvas:
             if state.cursor_pos is None:
                 continue
             cursor_overlay = display.copy()
+            cursor_radius = state.cursor_thickness // 2 + CURSOR_RING_PADDING
             cv2.circle(
                 cursor_overlay,
                 state.cursor_pos,
-                state.cursor_thickness // 2 + 4,
+                cursor_radius,
                 state.color,
                 -1,
             )
@@ -1494,8 +1643,15 @@ class AirCanvas:
             cv2.circle(
                 display,
                 state.cursor_pos,
-                state.cursor_thickness // 2 + 4,
+                cursor_radius,
                 (255, 255, 255),
+                3,
+            )
+            cv2.circle(
+                display,
+                state.cursor_pos,
+                cursor_radius + 6,
+                tuple(min(255, channel + 30) for channel in state.color),
                 2,
             )
             self._draw_clear_progress(display, state)
@@ -1515,11 +1671,11 @@ class AirCanvas:
     def _draw_gesture_overlay(self, display: np.ndarray):
         h, w = display.shape[:2]
         lines = [
-            "POINT Draw | PINCH Color | PALM Clear 1.5s",
-            "FIST Pause | S Save",
+            "POINT = Draw   PINCH = Color",
+            "PALM = Clear   FIST = Pause",
         ]
-        font_scale = 0.42
-        thickness = 1
+        font_scale = GESTURE_OVERLAY_FONT_SCALE
+        thickness = 2
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         if hasattr(cv2, "getTextSize"):
@@ -1532,8 +1688,8 @@ class AirCanvas:
             text_w = max(int(len(line) * 11 * font_scale) for line in lines)
             text_h = int(22 * font_scale)
 
-        margin_x = 14
-        margin_y = 10
+        margin_x = 20
+        margin_y = 14
         line_gap = 10
         box_w = text_w + margin_x * 2
         box_h = len(lines) * text_h + (len(lines) - 1) * line_gap + margin_y * 2
@@ -1547,10 +1703,17 @@ class AirCanvas:
             overlay,
             (x, y_box_top),
             (x + box_w, y_box_bottom),
-            (0, 0, 0),
+            (18, 22, 32),
             -1,
         )
-        cv2.addWeighted(display, 1.0, overlay, 0.6, 0, display)
+        cv2.addWeighted(display, 0.35, overlay, 0.65, 0, display)
+        cv2.rectangle(
+            display,
+            (x, y_box_top),
+            (x + box_w, y_box_bottom),
+            (255, 255, 255),
+            2,
+        )
 
         for index, line in enumerate(lines):
             y_text = y_box_top + margin_y + text_h + index * (text_h + line_gap)
@@ -1560,7 +1723,7 @@ class AirCanvas:
                 (x + margin_x, y_text),
                 font,
                 font_scale,
-                (200, 200, 200),
+                (242, 242, 242),
                 thickness,
                 cv2.LINE_AA,
             )
@@ -1571,8 +1734,20 @@ class AirCanvas:
         self._draw_palette(display, self.left_hand, now)
         self._draw_palette(display, self.right_hand, now)
         pulse = math.sin(now * 2.4)
-        self._draw_color_blob(display, (80, h - 85), self.left_hand.color, pulse)
-        self._draw_color_blob(display, (w - 80, h - 85), self.right_hand.color, -pulse)
+        self._draw_color_blob(
+            display,
+            (110, h - 115),
+            self.left_hand.color,
+            pulse,
+            self.left_hand.color_name,
+        )
+        self._draw_color_blob(
+            display,
+            (w - 110, h - 115),
+            self.right_hand.color,
+            -pulse,
+            self.right_hand.color_name,
+        )
         self._draw_rainbow_arc(display)
         self._draw_save_overlay(display, now)
         self._draw_gesture_overlay(display)
@@ -1706,9 +1881,124 @@ class AirCanvas:
                     self.particle_system.particles.clear()
                     self.particle_overlay[:] = 0
         finally:
+            if hasattr(self, "audio"):
+                self.audio.cleanup()
             self.camera_thread.stop()
             self.detector.close()
             cv2.destroyAllWindows()
+
+
+class AudioManager:
+    def __init__(self):
+        self._say_process = None
+        self._tone_process = None
+        self._music_process = None
+        self._music_thread: Optional[threading.Thread] = None
+        self._music_stop = threading.Event()
+        self._tone_cache: dict = {}
+        self._generated_paths: List[str] = []
+
+    def _audio_available(self) -> bool:
+        return AUDIO_ENABLED and sys.platform == "darwin"
+
+    def _create_wave_file(
+        self,
+        frequencies: List[int],
+        note_duration: float,
+        volume: float,
+    ) -> str:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sample_rate = 22050
+        frames = bytearray()
+        clamped_volume = max(0.0, min(1.0, volume))
+        for frequency in frequencies:
+            total_samples = max(1, int(sample_rate * note_duration))
+            for index in range(total_samples):
+                progress = index / total_samples
+                envelope = math.sin(math.pi * progress)
+                sample = math.sin(2.0 * math.pi * frequency * index / sample_rate)
+                value = int(32767 * clamped_volume * envelope * sample)
+                frames.extend(struct.pack("<h", value))
+        with wave.open(path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(frames))
+        self._generated_paths.append(path)
+        return path
+
+    def speak(self, text: str):
+        if not (
+            self._audio_available() and TTS_ENABLED and os.path.exists("/usr/bin/say")
+        ):
+            return
+        if self._say_process is not None and self._say_process.poll() is None:
+            self._say_process.terminate()
+        command = ["/usr/bin/say", "-r", str(TTS_RATE)]
+        if TTS_VOICE:
+            command.extend(["-v", str(TTS_VOICE)])
+        command.append(text)
+        self._say_process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def play_tone(self, frequency: int):
+        if not (
+            self._audio_available()
+            and TONE_ENABLED
+            and os.path.exists("/usr/bin/afplay")
+        ):
+            return
+        path = self._tone_cache.get(frequency)
+        if path is None:
+            path = self._create_wave_file([frequency], TONE_DURATION, TONE_VOLUME)
+            self._tone_cache[frequency] = path
+        self._tone_process = subprocess.Popen(
+            ["/usr/bin/afplay", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def start_music(self):
+        if not (
+            self._audio_available()
+            and BG_MUSIC_ENABLED
+            and os.path.exists("/usr/bin/afplay")
+        ):
+            return
+        if self._music_thread is not None and self._music_thread.is_alive():
+            return
+
+        def _loop_music():
+            while not self._music_stop.is_set():
+                path = self._create_wave_file(
+                    BG_MUSIC_NOTES, BG_MUSIC_TEMPO, BG_MUSIC_VOLUME
+                )
+                self._music_process = subprocess.Popen(
+                    ["/usr/bin/afplay", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._music_process.wait()
+
+        self._music_stop.clear()
+        self._music_thread = threading.Thread(target=_loop_music, daemon=True)
+        self._music_thread.start()
+
+    def cleanup(self):
+        self._music_stop.set()
+        for process in (self._say_process, self._tone_process, self._music_process):
+            if process is not None and process.poll() is None:
+                process.terminate()
+        if self._music_thread is not None and self._music_thread.is_alive():
+            self._music_thread.join(timeout=1.0)
+        for path in self._generated_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        self._generated_paths.clear()
 
 
 if __name__ == "__main__":

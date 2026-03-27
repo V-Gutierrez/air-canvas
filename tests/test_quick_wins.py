@@ -206,10 +206,33 @@ class TierThreeConfigTests(unittest.TestCase):
 
     def test_palette_defaults_match_backlog_contract(self):
         self.assertEqual(config.PALETTE_DWELL_TIME, 0.3)
-        self.assertEqual(config.PALETTE_CIRCLE_RADIUS, 25)
+        self.assertEqual(config.PALETTE_CIRCLE_RADIUS, 36)
 
     def test_debug_defaults_off_for_kid_view(self):
         self.assertFalse(config.DEBUG)
+
+    def test_kid_mode_thresholds_are_more_permissive(self):
+        self.assertEqual(config.DETECTION_CONFIDENCE, 0.5)
+        self.assertEqual(config.TRACKING_CONFIDENCE, 0.4)
+        self.assertEqual(config.PINCH_THRESHOLD, 0.08)
+        self.assertEqual(config.MIN_PALM_SIZE, 0.055)
+
+    def test_color_names_and_tones_match_palette_sizes(self):
+        self.assertEqual(
+            len(config.LEFT_HAND_COLOR_NAMES), len(config.LEFT_HAND_COLORS)
+        )
+        self.assertEqual(
+            len(config.RIGHT_HAND_COLOR_NAMES), len(config.RIGHT_HAND_COLORS)
+        )
+        self.assertEqual(
+            len(config.COLOR_TONE_FREQUENCIES), len(config.LEFT_HAND_COLORS)
+        )
+
+    def test_audio_defaults_enable_native_feedback(self):
+        self.assertTrue(config.AUDIO_ENABLED)
+        self.assertTrue(config.TTS_ENABLED)
+        self.assertTrue(config.TONE_ENABLED)
+        self.assertTrue(config.BG_MUSIC_ENABLED)
 
 
 class GestureContractTests(unittest.TestCase):
@@ -286,6 +309,173 @@ class GestureContractTests(unittest.TestCase):
         self.assertFalse(state.pinch_active)
         state.pinch_active = True
         self.assertTrue(state.pinch_active)
+
+    def test_finger_extension_detects_sideways_index(self):
+        landmarks = self._make_landmarks(z=0.0)
+        landmarks[air_canvas.INDEX_MCP].x = 0.30
+        landmarks[air_canvas.INDEX_PIP].x = 0.48
+        landmarks[air_canvas.INDEX_TIP].x = 0.72
+        self.assertTrue(
+            air_canvas.is_finger_extended(
+                landmarks, air_canvas.INDEX_TIP, air_canvas.INDEX_PIP
+            )
+        )
+
+    def test_finger_extension_detects_downward_index(self):
+        landmarks = self._make_landmarks(z=0.0)
+        landmarks[air_canvas.INDEX_MCP].y = 0.30
+        landmarks[air_canvas.INDEX_PIP].y = 0.48
+        landmarks[air_canvas.INDEX_TIP].y = 0.74
+        self.assertTrue(
+            air_canvas.is_finger_extended(
+                landmarks, air_canvas.INDEX_TIP, air_canvas.INDEX_PIP
+            )
+        )
+
+    def test_finger_extension_rejects_curled_index(self):
+        landmarks = self._make_landmarks(z=0.0)
+        landmarks[air_canvas.INDEX_MCP].x = 0.30
+        landmarks[air_canvas.INDEX_PIP].x = 0.60
+        landmarks[air_canvas.INDEX_TIP].x = 0.43
+        self.assertFalse(
+            air_canvas.is_finger_extended(
+                landmarks, air_canvas.INDEX_TIP, air_canvas.INDEX_PIP
+            )
+        )
+
+    def test_open_palm_rejects_small_palms(self):
+        landmarks = self._make_landmarks(z=0.0)
+        landmarks[air_canvas.INDEX_MCP].x = 0.505
+        landmarks[air_canvas.MIDDLE_MCP].x = 0.506
+        landmarks[air_canvas.PINKY_MCP].x = 0.507
+        self.assertLess(air_canvas.palm_size(landmarks), config.MIN_PALM_SIZE)
+
+
+class AudioAndPaletteTests(unittest.TestCase):
+    def test_hand_state_exposes_color_name_and_tone(self):
+        state = air_canvas.HandState(
+            config.LEFT_HAND_COLORS,
+            config.LEFT_HAND_COLOR_NAMES,
+            config.COLOR_TONE_FREQUENCIES,
+        )
+        self.assertEqual(state.color_name, "Cyan")
+        self.assertEqual(state.tone_frequency, config.COLOR_TONE_FREQUENCIES[0])
+
+    def test_set_state_color_announces_only_on_change(self):
+        canvas = air_canvas.AirCanvas.__new__(air_canvas.AirCanvas)
+        canvas.audio = mock.Mock()
+        state = air_canvas.HandState(
+            config.LEFT_HAND_COLORS,
+            config.LEFT_HAND_COLOR_NAMES,
+            config.COLOR_TONE_FREQUENCIES,
+        )
+
+        changed = canvas._set_state_color(state, 1, 10.0)
+        self.assertTrue(changed)
+        canvas.audio.speak.assert_called_once_with("Magenta")
+        canvas.audio.play_tone.assert_called_once_with(config.COLOR_TONE_FREQUENCIES[1])
+
+        canvas.audio.reset_mock()
+        changed = canvas._set_state_color(state, 1, 11.0)
+        self.assertFalse(changed)
+        canvas.audio.speak.assert_not_called()
+        canvas.audio.play_tone.assert_not_called()
+
+    def test_palette_hover_commits_color_after_dwell(self):
+        canvas = air_canvas.AirCanvas.__new__(air_canvas.AirCanvas)
+        canvas.audio = mock.Mock()
+        canvas.frame_w = 640
+        canvas.frame_h = 480
+        canvas.left_hand = air_canvas.HandState(
+            config.LEFT_HAND_COLORS,
+            config.LEFT_HAND_COLOR_NAMES,
+            config.COLOR_TONE_FREQUENCIES,
+        )
+        canvas.right_hand = air_canvas.HandState(
+            config.RIGHT_HAND_COLORS,
+            config.RIGHT_HAND_COLOR_NAMES,
+            list(reversed(config.COLOR_TONE_FREQUENCIES)),
+        )
+        state = canvas.left_hand
+        center = canvas._palette_positions(state)[2]
+
+        self.assertTrue(canvas._update_palette_hover(state, center, 1.0))
+        self.assertEqual(state.palette_hover_idx, 2)
+        self.assertEqual(state.color_idx, 0)
+
+        self.assertTrue(
+            canvas._update_palette_hover(state, center, 1.0 + config.PALETTE_DWELL_TIME)
+        )
+        self.assertEqual(state.color_idx, 2)
+        canvas.audio.speak.assert_called_once_with(config.LEFT_HAND_COLOR_NAMES[2])
+
+    def test_audio_manager_skips_when_not_on_darwin(self):
+        manager = air_canvas.AudioManager()
+        with (
+            mock.patch.object(air_canvas.sys, "platform", "linux"),
+            mock.patch.object(air_canvas.subprocess, "Popen") as popen,
+        ):
+            manager.speak("Blue")
+            manager.play_tone(523)
+            manager.start_music()
+        popen.assert_not_called()
+
+    def test_audio_manager_speak_uses_say(self):
+        manager = air_canvas.AudioManager()
+        fake_process = mock.Mock()
+        fake_process.poll.return_value = 0
+        with (
+            mock.patch.object(air_canvas.sys, "platform", "darwin"),
+            mock.patch.object(air_canvas.os.path, "exists", return_value=True),
+            mock.patch.object(
+                air_canvas.subprocess, "Popen", return_value=fake_process
+            ) as popen,
+        ):
+            manager.speak("Blue")
+
+        popen.assert_called_once()
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/say")
+        self.assertEqual(command[-1], "Blue")
+
+    def test_audio_manager_play_tone_uses_afplay(self):
+        manager = air_canvas.AudioManager()
+        fake_process = mock.Mock()
+        fake_process.poll.return_value = 0
+        with (
+            mock.patch.object(air_canvas.sys, "platform", "darwin"),
+            mock.patch.object(air_canvas.os.path, "exists", return_value=True),
+            mock.patch.object(
+                manager, "_create_wave_file", return_value="/tmp/tone.wav"
+            ) as create_wave,
+            mock.patch.object(
+                air_canvas.subprocess, "Popen", return_value=fake_process
+            ) as popen,
+        ):
+            manager.play_tone(523)
+
+        create_wave.assert_called_once()
+        popen.assert_called_once_with(
+            ["/usr/bin/afplay", "/tmp/tone.wav"],
+            stdout=air_canvas.subprocess.DEVNULL,
+            stderr=air_canvas.subprocess.DEVNULL,
+        )
+
+    def test_audio_manager_start_music_spawns_background_thread(self):
+        manager = air_canvas.AudioManager()
+        fake_thread = mock.Mock()
+        fake_thread.is_alive.return_value = False
+        with (
+            mock.patch.object(air_canvas.sys, "platform", "darwin"),
+            mock.patch.object(air_canvas.os.path, "exists", return_value=True),
+            mock.patch.object(
+                air_canvas.threading, "Thread", return_value=fake_thread
+            ) as thread_cls,
+        ):
+            manager.start_music()
+
+        thread_cls.assert_called_once()
+        fake_thread.start.assert_called_once()
 
 
 class SaveFeedbackTests(unittest.TestCase):
